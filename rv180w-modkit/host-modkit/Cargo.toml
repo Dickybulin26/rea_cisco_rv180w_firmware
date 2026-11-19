@@ -1,0 +1,18 @@
+[package]
+name = "host-modkit"
+version = "2.0.0-beta"
+edition = "2021"
+description = "Cisco RV180W v1.0.5.4 Firmware Unpack -> Patch -> Repack CLI"
+
+[dependencies]
+anyhow = "1"
+backhand = { version = "0.25", default-features = false, features = ["gzip"] }
+binrw = "0.14"
+clap = { version = "4", features = ["derive"] }
+crc32fast = "1"
+flate2 = "1"
+hex = "0.4"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+walkdir = "2"

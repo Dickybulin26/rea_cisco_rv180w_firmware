@@ -1,0 +1,9 @@
+# Proprietary firmware binaries and extracted vendor files
+*.img
+/rea_extracted/
+
+# Rust build & staging outputs
+/rv180w-modkit/target/
+/rv180w-modkit/build/
+/rv180w-modkit/dist/
+*.log

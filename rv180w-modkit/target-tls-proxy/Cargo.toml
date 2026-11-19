@@ -1,0 +1,15 @@
+[package]
+name = "target-tls-proxy"
+version = "2.0.0-beta"
+edition = "2021"
+description = "Lightweight TLS 1.2/1.3 reverse proxy for Cisco RV180W (ARM32 musl)"
+
+[[bin]]
+name = "modern-tls-proxy"
+path = "src/main.rs"
+
+[dependencies]
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+rustls-pemfile = "2"
+rcgen = { version = "0.14", default-features = false, features = ["crypto", "ring", "pem"] }
+time = "0.3"
