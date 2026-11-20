@@ -1,6 +1,11 @@
 [target.arm-unknown-linux-musleabi]
 linker = "rust-lld"
-rustflags = ["-C", "linker-flavor=ld.lld", "-C", "target-feature=+crt-static", "-C", "link-self-contained=yes"]
+rustflags = [
+  "-C", "linker-flavor=ld.lld",
+  "-C", "target-cpu=mpcorenovfp",
+  "-C", "target-feature=+crt-static,-vfp2,-vfp3,-neon,-thumb2",
+  "-C", "link-self-contained=yes",
+]
 
 [env]
 CC_arm_unknown_linux_musleabi = { value = "scripts/zig-arm-musleabi-cc.sh", relative = true }

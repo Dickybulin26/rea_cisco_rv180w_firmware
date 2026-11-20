@@ -342,33 +342,76 @@ pub fn patch_rootfs(work_dir: &Path, proxy_bin_path: &Path) -> Result<PatchRepor
 
 const FAST_BOOT_INIT: &str = r#"#!/bin/sh
 # rv180w-next v3.0 Fast-Boot Init (replaces 50+ sequential TeamF1 scripts & SQLite rebuild)
-# Failsafe: create /data/rv180w/.legacy_boot to revert to stock platformInit.legacy
+# Anti-brick failsafes:
+#   1) /data/rv180w/.legacy_boot flag file
+#   2) Physical Reset button held at boot (/proc/push_button == 1)
+#   3) Automatic fallback to platformInit.legacy if rv180wd --boot fails/crashes
 
-if [ -f /data/rv180w/.legacy_boot ]; then
-    echo "[rv180w-next] .legacy_boot detected -> falling back to platformInit.legacy"
+export PATH=/pfrm2.0/bin:/bin:/sbin:/usr/bin:/usr/sbin
+export LD_LIBRARY_PATH=/pfrm2.0/lib:/lib:/usr/lib
+
+mkdir -p /data /tmp /var/run /var/log
+mountpoint -q /data || mount -t jffs2 -onoatime,nodiratime /dev/mtdblock3 /data 2>/dev/null
+mkdir -p /data/rv180w /data/tmp
+
+# Failsafe 1 & 2: legacy flag or Reset button held during boot
+RESET_HELD=0
+if [ -r /proc/push_button ]; then
+    RESET_HELD="$(cat /proc/push_button 2>/dev/null | tr -d '[:space:]')"
+fi
+if [ -f /data/rv180w/.legacy_boot ] || [ "$RESET_HELD" = "1" ]; then
+    echo "[rv180w-next] Failsafe triggered -> exec platformInit.legacy" >/tmp/rv180wd-boot.log 2>&1
     exec /bin/sh /pfrm2.0/etc/platformInit.legacy
 fi
 
-echo "[rv180w-next] Fast-booting Cisco RV180W (Pure Rust control plane)..."
-mkdir -p /data/rv180w /var/run /var/log /tmp
+echo "[rv180w-next] Fast-booting Cisco RV180W (Pure Rust control plane)..." >/tmp/rv180wd-boot.log
 
-# 1. Load essential hardware modules only (switch + Wi-Fi Atheros MADWiFi)
-[ -f /pfrm2.0/lib/modules/swdrv/bcm5398.ko ] && insmod /pfrm2.0/lib/modules/swdrv/bcm5398.ko 2>/dev/null
+KREL="$(uname -r 2>/dev/null)"
+
+# Essential hardware modules (idempotent; rcS may have loaded some already)
+for mod in \
+    "/pfrm2.0/lib/modules/${KREL}/kernel/drivers/net/cns3xxx/cns3xxx.ko" \
+    "/pfrm2.0/lib/modules/cns3xxx.ko" \
+    "/pfrm2.0/lib/modules/${KREL}/kernel/drivers/net/cns3xxx/scm-led.ko" \
+    "/pfrm2.0/lib/modules/${KREL}/kernel/drivers/net/cns3xxx/push_button.ko" \
+    "/pfrm2.0/lib/modules/sppe.ko" \
+    "/pfrm2.0/lib/modules/swdrv/bcm5398.ko" \
+    "/pfrm2.0/lib/modules/powerMode.ko"; do
+    [ -f "$mod" ] && insmod "$mod" >/dev/null 2>&1 || true
+done
+
+# Ensure switch device node and basic VLAN/WAN port setup if helpers exist
+[ -c /dev/bcm53980 ] || { MAJ="$(awk '$2=="bcm5395"{print $1}' /proc/devices 2>/dev/null)"; [ -n "$MAJ" ] && mknod /dev/bcm53980 c "$MAJ" 0 2>/dev/null; }
+[ -x /pfrm2.0/bin/vlan_table_func ] && /pfrm2.0/bin/vlan_table_func init >/dev/null 2>&1 || true
+[ -x /pfrm2.0/bin/set_wan_port_func ] && /pfrm2.0/bin/set_wan_port_func set 2 >/dev/null 2>&1 || true
+
+# Bring up base interfaces (best-effort; reconciler will configure addresses)
+[ -x /sbin/ifconfig ] && { /sbin/ifconfig lo 127.0.0.1 up >/dev/null 2>&1 || true; /sbin/ifconfig eth0 up >/dev/null 2>&1 || true; /sbin/ifconfig eth1 up >/dev/null 2>&1 || true; }
+
+# Wi-Fi Atheros MADWiFi modules (best-effort)
 MODULES_DIR=/pfrm2.0/lib/modules/dot11
-for mod in kdot11 wlan wlan_scan_ap ath_hal ath_dfs ath_rate_sample; do
-    [ -f "$MODULES_DIR/${mod}.ko" ] && insmod "$MODULES_DIR/${mod}.ko" 2>/dev/null
-done
-[ -f "$MODULES_DIR/ath_pci.ko" ] && insmod "$MODULES_DIR/ath_pci.ko" autocreate=none 2>/dev/null
-for mod in wlan_xauth wlan_ccmp wlan_tkip wlan_acl; do
-    [ -f "$MODULES_DIR/${mod}.ko" ] && insmod "$MODULES_DIR/${mod}.ko" 2>/dev/null
-done
+if [ -d "$MODULES_DIR" ]; then
+    for mod in kdot11 wlan wlan_scan_ap ath_hal ath_dfs ath_rate_sample; do
+        [ -f "$MODULES_DIR/${mod}.ko" ] && insmod "$MODULES_DIR/${mod}.ko" >/dev/null 2>&1 || true
+    done
+    [ -f "$MODULES_DIR/ath_pci.ko" ] && insmod "$MODULES_DIR/ath_pci.ko" autocreate=none >/dev/null 2>&1 || true
+    for mod in wlan_xauth wlan_ccmp wlan_tkip wlan_acl; do
+        [ -f "$MODULES_DIR/${mod}.ko" ] && insmod "$MODULES_DIR/${mod}.ko" >/dev/null 2>&1 || true
+    done
+fi
 
-# 2. Apply persisted atomic config.json in < 1s (zero SQLite rebuild)
-/pfrm2.0/bin/rv180wd --boot
+# Apply persisted atomic config.json in < 1s (zero SQLite rebuild). Never brick on failure.
+if ! /pfrm2.0/bin/rv180wd --boot >>/tmp/rv180wd-boot.log 2>&1; then
+    echo "[rv180w-next] rv180wd --boot failed! Reverting to platformInit.legacy" >>/tmp/rv180wd-boot.log
+    exec /bin/sh /pfrm2.0/etc/platformInit.legacy
+fi
 
-# 3. Launch single ultra-light control plane daemon (HTTP :80 + HTTPS TLS 1.2/1.3 :443)
-/pfrm2.0/bin/rv180wd --serve >/tmp/rv180wd.log 2>&1 &
-echo "[rv180w-next] Ready."
+# Launch single ultra-light control plane daemon (HTTP :80 + HTTPS TLS 1.2/1.3 :443)
+if [ -x /pfrm2.0/bin/rv180wd ]; then
+    /pfrm2.0/bin/rv180wd --serve >/tmp/rv180wd.log 2>&1 &
+fi
+
+echo "[rv180w-next] Ready." >>/tmp/rv180wd-boot.log
 "#;
 
 /// Patch rootfs for `rv180w-next` v3.0: injects static ARMv6 `rv180wd` and Fast-Boot Init

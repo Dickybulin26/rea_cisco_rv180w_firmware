@@ -21,8 +21,23 @@ cleanup() {
 }
 trap cleanup EXIT INT TERM
 
-echo "[1/6] Testing rv180wd --boot under qemu-arm-static (dry-run)..."
-RV180WD_DATA_DIR="$TMP_DATA" RV180WD_DRY_RUN=1 qemu-arm-static "$BIN" --boot
+echo "[0/6] Checking ELF ARMv6 attributes (no VFP/Thumb-2)..."
+if command -v readelf >/dev/null 2>&1; then
+    readelf -A "$BIN" >"$TMP_DATA/readelf-A.txt" 2>&1 || true
+    if grep -q "Tag_CPU_arch: v7" "$TMP_DATA/readelf-A.txt"; then
+        echo "ERROR: rv180wd built for ARMv7 (Tag_CPU_arch: v7)" >&2; exit 1
+    fi
+    if grep -q "Tag_FP_arch" "$TMP_DATA/readelf-A.txt"; then
+        echo "ERROR: rv180wd contains Tag_FP_arch (VFP) but target is soft-float" >&2; exit 1
+    fi
+    if grep -q "Tag_THUMB_ISA_use: Thumb-2" "$TMP_DATA/readelf-A.txt"; then
+        echo "ERROR: rv180wd uses Thumb-2 instructions" >&2; exit 1
+    fi
+    echo "[OK] ELF attributes look ARMv6-softfloat compatible"
+fi
+
+echo "[1/6] Testing rv180wd --boot under qemu-arm-static -cpu arm11mpcore (dry-run)..."
+RV180WD_DATA_DIR="$TMP_DATA" RV180WD_DRY_RUN=1 qemu-arm-static -cpu arm11mpcore "$BIN" --boot
 
 echo "[2/6] Starting rv180wd --serve (HTTP :${HTTP_PORT} + HTTPS TLS 1.2/1.3 :${HTTPS_PORT})..."
 RV180WD_DATA_DIR="$TMP_DATA" \
@@ -30,7 +45,7 @@ RV180WD_DRY_RUN=1 \
 RV180WD_HTTP_ADDR="127.0.0.1:${HTTP_PORT}" \
 RV180WD_HTTPS_ADDR="127.0.0.1:${HTTPS_PORT}" \
 RV180WD_SAN_IP="192.168.1.1" \
-qemu-arm-static "$BIN" --serve >"$TMP_DATA/server.log" 2>&1 &
+qemu-arm-static -cpu arm11mpcore "$BIN" --serve >"$TMP_DATA/server.log" 2>&1 &
 DAEMON_PID=$!
 sleep 2
 

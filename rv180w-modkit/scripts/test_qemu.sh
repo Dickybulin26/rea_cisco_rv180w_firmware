@@ -27,8 +27,23 @@ python3 -m http.server "$HTTP_PORT" --bind 127.0.0.1 --directory "$WORK_DIR/squa
 BACKEND_PID=$!
 sleep 0.5
 
-echo "[2/4] Launching ARM32 static modern-tls-proxy under qemu-arm-static on 127.0.0.1:${HTTPS_PORT}..."
-qemu-arm-static "$PROXY_BIN" \
+echo "[1b/4] Checking ELF ARMv6 attributes (no VFP/Thumb-2)..."
+if command -v readelf >/dev/null 2>&1; then
+    readelf -A "$PROXY_BIN" >/tmp/rv180w-proxy-readelf-A.txt 2>&1 || true
+    if grep -q "Tag_CPU_arch: v7" /tmp/rv180w-proxy-readelf-A.txt; then
+        echo "ERROR: modern-tls-proxy built for ARMv7" >&2; exit 1
+    fi
+    if grep -q "Tag_FP_arch" /tmp/rv180w-proxy-readelf-A.txt; then
+        echo "ERROR: modern-tls-proxy contains Tag_FP_arch (VFP)" >&2; exit 1
+    fi
+    if grep -q "Tag_THUMB_ISA_use: Thumb-2" /tmp/rv180w-proxy-readelf-A.txt; then
+        echo "ERROR: modern-tls-proxy uses Thumb-2 instructions" >&2; exit 1
+    fi
+    echo "[OK] ELF attributes look ARMv6-softfloat compatible"
+fi
+
+echo "[2/4] Launching ARM32 static modern-tls-proxy under qemu-arm-static -cpu arm11mpcore on 127.0.0.1:${HTTPS_PORT}..."
+qemu-arm-static -cpu arm11mpcore "$PROXY_BIN" \
     --listen "127.0.0.1:${HTTPS_PORT}" \
     --backend "127.0.0.1:${HTTP_PORT}" \
     --cert-dir "$TMP_CERT_DIR" \
