@@ -29,12 +29,14 @@ enum Commands {
         #[arg(short, long, default_value = "build")]
         work_dir: PathBuf,
     },
-    /// Patch extracted squashfs-root with ARM32 modern-tls-proxy, init wrapper, and UI fixes
+    /// Patch extracted squashfs-root (v2 proxy mode with --proxy-bin, or v3 rv180w-next mode with --rv180wd-bin)
     Patch {
         #[arg(short, long, default_value = "build")]
         work_dir: PathBuf,
         #[arg(short, long)]
-        proxy_bin: PathBuf,
+        proxy_bin: Option<PathBuf>,
+        #[arg(long)]
+        rv180wd_bin: Option<PathBuf>,
     },
     /// Repack patched squashfs-root into a checksum-valid RV180W firmware image
     Repack {
@@ -50,7 +52,9 @@ enum Commands {
         #[arg(short, long)]
         input: PathBuf,
         #[arg(short, long)]
-        proxy_bin: PathBuf,
+        proxy_bin: Option<PathBuf>,
+        #[arg(long)]
+        rv180wd_bin: Option<PathBuf>,
         #[arg(short, long, default_value = "build")]
         work_dir: PathBuf,
         #[arg(short, long, default_value = "dist/RV180W-Firmware-1.0.5.4-MOD.img")]
@@ -96,10 +100,18 @@ fn main() -> Result<()> {
                 work_dir.display()
             );
         }
-        Commands::Patch { work_dir, proxy_bin } => {
-            let r = patcher::patch_rootfs(&work_dir, &proxy_bin)?;
+        Commands::Patch {
+            work_dir,
+            proxy_bin,
+            rv180wd_bin,
+        } => {
+            let r = match (rv180wd_bin, proxy_bin) {
+                (Some(bin), _) => patcher::patch_rootfs_next(&work_dir, &bin)?,
+                (None, Some(bin)) => patcher::patch_rootfs(&work_dir, &bin)?,
+                (None, None) => anyhow::bail!("provide either --rv180wd-bin (v3) or --proxy-bin (v2)"),
+            };
             println!("[OK] Patched {}/squashfs-root", work_dir.display());
-            println!("  Proxy binary : {} bytes (ARM32 ELF verified)", r.proxy_size_bytes);
+            println!("  ARM32 binary : {} bytes (ELF32 ARM verified)", r.proxy_size_bytes);
             for item in &r.patched_files {
                 println!("  + {}", item);
             }
@@ -120,6 +132,7 @@ fn main() -> Result<()> {
         Commands::Build {
             input,
             proxy_bin,
+            rv180wd_bin,
             work_dir,
             output,
             max_image_bytes,
@@ -132,9 +145,13 @@ fn main() -> Result<()> {
             );
 
             println!("==> [2/3] Patching root filesystem...");
-            let p = patcher::patch_rootfs(&work_dir, &proxy_bin)?;
+            let p = match (rv180wd_bin, proxy_bin) {
+                (Some(bin), _) => patcher::patch_rootfs_next(&work_dir, &bin)?,
+                (None, Some(bin)) => patcher::patch_rootfs(&work_dir, &bin)?,
+                (None, None) => anyhow::bail!("provide either --rv180wd-bin (v3) or --proxy-bin (v2)"),
+            };
             println!(
-                "    Injected ARM32 proxy ({} bytes) and {} patches.",
+                "    Injected ARM32 binary ({} bytes) and {} patches.",
                 p.proxy_size_bytes,
                 p.patched_files.len()
             );

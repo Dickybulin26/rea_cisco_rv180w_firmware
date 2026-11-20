@@ -60,6 +60,27 @@ pub fn load_or_default(path: &Path) -> AuthDb {
     }
 }
 
+fn set_owner_only(path: &Path) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = fs::set_permissions(path, fs::Permissions::from_mode(0o600));
+    }
+}
+
+fn write_and_sync(path: &Path, bytes: &[u8]) -> io::Result<()> {
+    let mut f = OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(true)
+        .open(path)?;
+    set_owner_only(path);
+    f.write_all(bytes)?;
+    f.write_all(b"\n")?;
+    f.sync_all()?;
+    Ok(())
+}
+
 pub fn save_atomic(path: &Path, db: &AuthDb) -> io::Result<()> {
     let dir = path
         .parent()
@@ -67,21 +88,22 @@ pub fn save_atomic(path: &Path, db: &AuthDb) -> io::Result<()> {
     fs::create_dir_all(dir)?;
     let json = serde_json::to_vec_pretty(db)
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-    let tmp = path.with_extension("json.tmp");
-    {
-        let mut f = OpenOptions::new()
-            .create(true)
-            .write(true)
-            .truncate(true)
-            .open(&tmp)?;
-        f.write_all(&json)?;
-        f.write_all(b"\n")?;
-        f.sync_all()?;
-    }
+
     if path.exists() {
-        let _ = fs::copy(path, path.with_extension("json.bak"));
+        if let Ok(prev) = fs::read(path) {
+            let bak_tmp = path.with_extension("json.bak.tmp");
+            let bak = path.with_extension("json.bak");
+            if write_and_sync(&bak_tmp, &prev).is_ok() {
+                let _ = fs::rename(&bak_tmp, &bak);
+                set_owner_only(&bak);
+            }
+        }
     }
+
+    let tmp = path.with_extension("json.tmp");
+    write_and_sync(&tmp, &json)?;
     fs::rename(&tmp, path)?;
+    set_owner_only(path);
     File::open(dir)?.sync_all()?;
     Ok(())
 }
@@ -99,15 +121,23 @@ mod tests {
     }
 
     #[test]
-    fn auth_store_roundtrip_and_verify() {
+    fn auth_store_roundtrip_verify_and_0600_perms() {
         let dir = temp_dir();
         let path = dir.join("auth.json");
         let mut db = AuthDb::default();
-        db.upsert_user("admin", "secret-pass", "admin");
+        db.upsert_user("admin", "secret'\"pass", "admin");
         save_atomic(&path, &db).unwrap();
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600);
+        }
+
         let loaded = load_or_default(&path);
         assert!(loaded.initialized);
-        assert!(loaded.verify("admin", "secret-pass"));
+        assert!(loaded.verify("admin", "secret'\"pass"));
         assert!(!loaded.verify("admin", "wrong"));
         let _ = fs::remove_dir_all(dir);
     }

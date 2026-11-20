@@ -1,18 +1,22 @@
 [package]
 name = "rv180wd"
-version = "3.0.0-alpha"
+version = "3.0.0-beta"
 edition = "2021"
-description = "Cisco RV180W next-gen pure Rust control plane daemon (rv180w-next)"
+description = "Cisco RV180W next-gen ultra-light pure Rust control plane daemon (rv180w-next)"
 
 [[bin]]
 name = "rv180wd"
 path = "src/main.rs"
 
 [dependencies]
+base64 = "0.22"
+hmac = "0.12"
+pbkdf2 = "0.12"
+rand = "0.8"
+rcgen = { version = "0.14", default-features = false, features = ["crypto", "ring", "pem"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+rustls-pemfile = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
-pbkdf2 = "0.12"
-hmac = "0.12"
-rand = "0.8"
-base64 = "0.22"
+time = "0.3"

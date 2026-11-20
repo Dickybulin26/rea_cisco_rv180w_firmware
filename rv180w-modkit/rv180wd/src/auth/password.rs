@@ -6,7 +6,10 @@ use sha2::Sha256;
 
 const SALT_LEN: usize = 16;
 const KEY_LEN: usize = 32; // 256-bit derived key
-const DEFAULT_ITERATIONS: u32 = 120_000;
+// Tuned for Cavium CNS3xxx ARMv6 (~300-600 MHz without SHA hardware acceleration):
+// strong KDF resistance while keeping login responsive (< 300ms) and preventing CPU DoS.
+const DEFAULT_ITERATIONS: u32 = 25_000;
+const MAX_ITERATIONS: u32 = 1_000_000;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PasswordHash {
@@ -29,10 +32,13 @@ impl PasswordHash {
         if alg != "pbkdf2-sha256" {
             return None;
         }
-        let iterations = parts.next()?.parse().ok()?;
+        let iterations: u32 = parts.next()?.parse().ok()?;
+        if iterations == 0 || iterations > MAX_ITERATIONS {
+            return None;
+        }
         let salt_b64 = parts.next()?.to_string();
         let hash_b64 = parts.next()?.to_string();
-        if parts.next().is_some() {
+        if parts.next().is_some() || salt_b64.is_empty() || hash_b64.is_empty() {
             return None;
         }
         Some(Self {
@@ -48,9 +54,10 @@ pub fn hash_password(password: &str) -> PasswordHash {
 }
 
 pub fn hash_password_with_iterations(password: &str, iterations: u32) -> PasswordHash {
+    let iters = iterations.clamp(1, MAX_ITERATIONS);
     let mut salt = [0u8; SALT_LEN];
     OsRng.fill_bytes(&mut salt);
-    derive(&salt, password, iterations)
+    derive(&salt, password, iters)
 }
 
 fn derive(salt: &[u8], password: &str, iterations: u32) -> PasswordHash {
@@ -73,9 +80,13 @@ pub fn verify_password(password: &str, encoded: &str) -> bool {
     let Ok(expected) = B64.decode(ph.hash_b64.as_bytes()) else {
         return false;
     };
-    let mut dk = vec![0u8; expected.len().max(KEY_LEN)];
-    pbkdf2_hmac::<Sha256>(password.as_bytes(), &salt, ph.iterations, &mut dk[..expected.len()]);
-    constant_time_eq(&dk[..expected.len()], &expected)
+    // Prevent empty/truncated hash bypass and weak/corrupt salts.
+    if salt.len() < SALT_LEN || expected.len() != KEY_LEN {
+        return false;
+    }
+    let mut dk = [0u8; KEY_LEN];
+    pbkdf2_hmac::<Sha256>(password.as_bytes(), &salt, ph.iterations, &mut dk);
+    constant_time_eq(&dk, &expected)
 }
 
 fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
@@ -96,7 +107,7 @@ mod tests {
     #[test]
     fn hash_and_verify_roundtrip() {
         let pw = "Str0ng!P@ssw0rd#2026";
-        let h = hash_password_with_iterations(pw, 10_000);
+        let h = hash_password_with_iterations(pw, 5_000);
         let enc = h.encode();
         assert!(verify_password(pw, &enc));
         assert!(!verify_password("wrong", &enc));
@@ -105,7 +116,16 @@ mod tests {
     #[test]
     fn supports_special_characters() {
         let pw = "p@ss'\";DROP TABLE users;--";
-        let h = hash_password_with_iterations(pw, 10_000);
+        let h = hash_password_with_iterations(pw, 5_000);
         assert!(verify_password(pw, &h.encode()));
+    }
+
+    #[test]
+    fn rejects_corrupt_or_empty_hashes() {
+        let valid_salt = B64.encode([1u8; SALT_LEN]);
+        assert!(!verify_password("anything", &format!("pbkdf2-sha256$1000${valid_salt}$")));
+        assert!(!verify_password("anything", &format!("pbkdf2-sha256$0${valid_salt}$AAAA")));
+        assert!(!verify_password("anything", "pbkdf2-sha256$1000$short$AAAA"));
+        assert!(!verify_password("anything", &format!("pbkdf2-sha256$1000${valid_salt}$AAAA")));
     }
 }

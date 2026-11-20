@@ -8,12 +8,19 @@ pub const DEFAULT_DATA_DIR: &str = "/data/rv180w";
 pub const DEFAULT_CONFIG_FILE: &str = "config.json";
 pub const DEFAULT_BACKUP_FILE: &str = "config.json.bak";
 
-pub fn default_config_path() -> PathBuf {
-    Path::new(DEFAULT_DATA_DIR).join(DEFAULT_CONFIG_FILE)
+pub fn data_dir() -> PathBuf {
+    std::env::var("RV180WD_DATA_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| PathBuf::from(DEFAULT_DATA_DIR))
 }
 
+pub fn default_config_path() -> PathBuf {
+    data_dir().join(DEFAULT_CONFIG_FILE)
+}
+
+#[allow(dead_code)]
 pub fn default_backup_path() -> PathBuf {
-    Path::new(DEFAULT_DATA_DIR).join(DEFAULT_BACKUP_FILE)
+    data_dir().join(DEFAULT_BACKUP_FILE)
 }
 
 /// Load config from disk. If missing or invalid, returns defaults (non-destructive).
@@ -24,41 +31,48 @@ pub fn load_or_default(path: &Path) -> Config {
     }
 }
 
-/// Atomically persist config: write tmp -> fsync tmp -> backup current -> fsync dir -> rename tmp.
-/// Also keeps `.bak` as rollback copy when a previous config exists.
+fn write_and_sync(path: &Path, bytes: &[u8]) -> io::Result<()> {
+    let mut f = OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(true)
+        .open(path)?;
+    f.write_all(bytes)?;
+    f.sync_all()?;
+    Ok(())
+}
+
+/// Atomically persist config: write & fsync backup -> write & fsync tmp -> atomic rename -> fsync dir.
 pub fn save_atomic(path: &Path, cfg: &Config) -> io::Result<()> {
     let dir = path
         .parent()
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "config path has no parent"))?;
     fs::create_dir_all(dir)?;
 
-    let json = serde_json::to_vec_pretty(cfg)
+    let mut json = serde_json::to_vec_pretty(cfg)
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+    json.push(b'\n');
+
+    // Preserve previous good config atomically as .bak for rollback/failsafe.
+    if path.exists() {
+        if let Ok(prev) = fs::read(path) {
+            let bak_tmp = path.with_extension("json.bak.tmp");
+            let bak = path.with_extension("json.bak");
+            if write_and_sync(&bak_tmp, &prev).is_ok() {
+                let _ = fs::rename(&bak_tmp, &bak);
+            }
+        }
+    }
 
     let tmp_path = path.with_extension("json.tmp");
-    {
-        let mut tmp = OpenOptions::new()
-            .create(true)
-            .write(true)
-            .truncate(true)
-            .open(&tmp_path)?;
-        tmp.write_all(&json)?;
-        tmp.write_all(b"\n")?;
-        tmp.sync_all()?;
-    }
-
-    // Preserve previous good config as .bak for rollback/failsafe.
-    if path.exists() {
-        let bak = path.with_extension("json.bak");
-        let _ = fs::copy(path, bak);
-    }
-
+    write_and_sync(&tmp_path, &json)?;
     fs::rename(&tmp_path, path)?;
     sync_dir(dir)?;
     Ok(())
 }
 
-pub fn rollback_to_backup(path: &Path) -> io::Result<()> {
+/// Atomically restore `.bak` over `config.json` (crash-safe even on sudden power loss).
+pub fn rollback_to_backup(path: &Path) -> io::Result<Config> {
     let bak = path.with_extension("json.bak");
     if !bak.exists() {
         return Err(io::Error::new(
@@ -66,34 +80,41 @@ pub fn rollback_to_backup(path: &Path) -> io::Result<()> {
             "backup config not found",
         ));
     }
-    fs::copy(&bak, path)?;
+    let bak_bytes = fs::read(&bak)?;
+    let parsed: Config = serde_json::from_slice(&bak_bytes)
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("corrupt backup: {e}")))?;
+
+    let tmp_path = path.with_extension("json.rollback.tmp");
+    write_and_sync(&tmp_path, &bak_bytes)?;
+    fs::rename(&tmp_path, path)?;
     if let Some(dir) = path.parent() {
         sync_dir(dir)?;
     }
-    Ok(())
+    Ok(parsed)
 }
 
 pub fn factory_reset_default_paths() -> io::Result<()> {
-    let dir = Path::new(DEFAULT_DATA_DIR);
+    let dir = data_dir();
     if dir.exists() {
-        // Keep directory but remove rv180w-next state files; preserve unrelated data if any.
-        let cfg = dir.join(DEFAULT_CONFIG_FILE);
-        let bak = dir.join(DEFAULT_BACKUP_FILE);
-        let tmp = dir.join("config.json.tmp");
-        let auth = dir.join("auth.json");
-        let auth_bak = dir.join("auth.json.bak");
-        for p in [cfg, bak, tmp, auth, auth_bak] {
+        for name in [
+            DEFAULT_CONFIG_FILE,
+            DEFAULT_BACKUP_FILE,
+            "config.json.tmp",
+            "auth.json",
+            "auth.json.bak",
+            "auth.json.tmp",
+        ] {
+            let p = dir.join(name);
             if p.exists() {
                 let _ = fs::remove_file(p);
             }
         }
-        sync_dir(dir)?;
+        sync_dir(&dir)?;
     }
     Ok(())
 }
 
 fn sync_dir(dir: &Path) -> io::Result<()> {
-    // fsync directory for durability on POSIX filesystems.
     let f = File::open(dir)?;
     f.sync_all()
 }
@@ -114,7 +135,7 @@ mod tests {
     }
 
     #[test]
-    fn save_load_and_backup_roundtrip() {
+    fn save_load_and_atomic_rollback_roundtrip() {
         let dir = temp_dir("cfg");
         let path = dir.join("config.json");
         let mut cfg = Config::default();
@@ -129,9 +150,9 @@ mod tests {
         save_atomic(&path, &cfg2).unwrap();
         assert!(path.with_extension("json.bak").exists());
 
-        rollback_to_backup(&path).unwrap();
-        let rolled = load_or_default(&path);
+        let rolled = rollback_to_backup(&path).unwrap();
         assert_eq!(rolled.system.hostname, "router-test");
+        assert_eq!(load_or_default(&path).system.hostname, "router-test");
 
         let _ = fs::remove_dir_all(dir);
     }
