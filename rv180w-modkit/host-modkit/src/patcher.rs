@@ -339,3 +339,108 @@ pub fn patch_rootfs(work_dir: &Path, proxy_bin_path: &Path) -> Result<PatchRepor
         patched_files: patched,
     })
 }
+
+const FAST_BOOT_INIT: &str = r#"#!/bin/sh
+# rv180w-next v3.0 Fast-Boot Init (replaces 50+ sequential TeamF1 scripts & SQLite rebuild)
+# Failsafe: create /data/rv180w/.legacy_boot to revert to stock platformInit.legacy
+
+if [ -f /data/rv180w/.legacy_boot ]; then
+    echo "[rv180w-next] .legacy_boot detected -> falling back to platformInit.legacy"
+    exec /bin/sh /pfrm2.0/etc/platformInit.legacy
+fi
+
+echo "[rv180w-next] Fast-booting Cisco RV180W (Pure Rust control plane)..."
+mkdir -p /data/rv180w /var/run /var/log /tmp
+
+# 1. Load essential hardware modules only (switch + Wi-Fi Atheros MADWiFi)
+[ -f /pfrm2.0/lib/modules/swdrv/bcm5398.ko ] && insmod /pfrm2.0/lib/modules/swdrv/bcm5398.ko 2>/dev/null
+MODULES_DIR=/pfrm2.0/lib/modules/dot11
+for mod in kdot11 wlan wlan_scan_ap ath_hal ath_dfs ath_rate_sample; do
+    [ -f "$MODULES_DIR/${mod}.ko" ] && insmod "$MODULES_DIR/${mod}.ko" 2>/dev/null
+done
+[ -f "$MODULES_DIR/ath_pci.ko" ] && insmod "$MODULES_DIR/ath_pci.ko" autocreate=none 2>/dev/null
+for mod in wlan_xauth wlan_ccmp wlan_tkip wlan_acl; do
+    [ -f "$MODULES_DIR/${mod}.ko" ] && insmod "$MODULES_DIR/${mod}.ko" 2>/dev/null
+done
+
+# 2. Apply persisted atomic config.json in < 1s (zero SQLite rebuild)
+/pfrm2.0/bin/rv180wd --boot
+
+# 3. Launch single ultra-light control plane daemon (HTTP :80 + HTTPS TLS 1.2/1.3 :443)
+/pfrm2.0/bin/rv180wd --serve >/tmp/rv180wd.log 2>&1 &
+echo "[rv180w-next] Ready."
+"#;
+
+/// Patch rootfs for `rv180w-next` v3.0: injects static ARMv6 `rv180wd` and Fast-Boot Init
+/// while preserving `/pfrm2.0/etc/platformInit.legacy` for failsafe recovery.
+pub fn patch_rootfs_next(work_dir: &Path, rv180wd_bin_path: &Path) -> Result<PatchReport> {
+    let root = work_dir.join("squashfs-root");
+    if !root.is_dir() {
+        bail!(
+            "squashfs-root not found at {} — run `unpack` first",
+            root.display()
+        );
+    }
+    if !rv180wd_bin_path.is_file() {
+        bail!(
+            "ARM32 rv180wd binary not found at {}",
+            rv180wd_bin_path.display()
+        );
+    }
+
+    let bin_bytes = fs::read(rv180wd_bin_path)
+        .with_context(|| format!("failed to read rv180wd binary {}", rv180wd_bin_path.display()))?;
+    if bin_bytes.len() < 20 || &bin_bytes[0..4] != b"\x7fELF" {
+        bail!("rv180wd binary {} is not an ELF executable", rv180wd_bin_path.display());
+    }
+    let elf_class = bin_bytes[4];
+    let elf_machine = u16::from_le_bytes([bin_bytes[18], bin_bytes[19]]);
+    if elf_class != 1 || elf_machine != 40 {
+        bail!(
+            "rv180wd binary {} must be ELF32 ARM (class=1, machine=40), got class={}, machine={}",
+            rv180wd_bin_path.display(),
+            elf_class,
+            elf_machine
+        );
+    }
+
+    let mut patched = Vec::new();
+
+    // 1. Install static ARMv6 rv180wd binary
+    let dst_bin = root.join("bin/rv180wd");
+    fs::write(&dst_bin, &bin_bytes)?;
+    fs::set_permissions(&dst_bin, fs::Permissions::from_mode(0o755))?;
+    patched.push("/pfrm2.0/bin/rv180wd (static ARMv6 Rust control plane)".to_string());
+
+    // 2. Preserve stock platformInit as platformInit.legacy and install fastBootInit hook
+    let plat_init = root.join("etc/platformInit");
+    let plat_legacy = root.join("etc/platformInit.legacy");
+    if !plat_legacy.exists() && plat_init.exists() {
+        fs::rename(&plat_init, &plat_legacy)?;
+        fs::set_permissions(&plat_legacy, fs::Permissions::from_mode(0o755))?;
+        patched.push("/pfrm2.0/etc/platformInit.legacy (failsafe preserved)".to_string());
+    }
+    let fast_init = root.join("etc/fastBootInit");
+    fs::write(&fast_init, FAST_BOOT_INIT)?;
+    fs::set_permissions(&fast_init, fs::Permissions::from_mode(0o755))?;
+    patched.push("/pfrm2.0/etc/fastBootInit".to_string());
+
+    // rcS sources `./platformInit` (`. ./platformInit`), so delegate to fastBootInit safely
+    fs::write(&plat_init, "#!/bin/sh\n. /pfrm2.0/etc/fastBootInit\n")?;
+    fs::set_permissions(&plat_init, fs::Permissions::from_mode(0o755))?;
+    patched.push("/pfrm2.0/etc/platformInit -> fastBootInit".to_string());
+
+    // 3. Write v3.0 release marker
+    let mod_rel = root.join("etc/mod_release");
+    fs::write(
+        &mod_rel,
+        "MOD_NAME=rv180w-next\nVERSION=3.0.0-beta\nBASE_FIRMWARE=1.0.5.4\nTLS_VERSIONS=1.2,1.3\n",
+    )?;
+    fs::set_permissions(&mod_rel, fs::Permissions::from_mode(0o644))?;
+    patched.push("/pfrm2.0/etc/mod_release".to_string());
+
+    Ok(PatchReport {
+        proxy_size_bytes: bin_bytes.len() as u64,
+        patched_files: patched,
+    })
+}

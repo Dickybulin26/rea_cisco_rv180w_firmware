@@ -1,0 +1,358 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Cisco RV180W Next — Control Plane</title>
+<style>
+:root{--bg:#0b1120;--panel:#111827;--card:#1e293b;--border:#334155;--text:#f1f5f9;--muted:#94a3b8;--accent:#38bdf8;--ok:#22c55e;--warn:#f59e0b;--err:#ef4444}
+*{box-sizing:border-box}body{margin:0;font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif;background:var(--bg);color:var(--text);line-height:1.45}
+.hidden{display:none!important}
+.center{min-height:100vh;display:flex;align-items:center;justify-content:center;padding:1rem}
+.auth-box{width:100%;max-width:400px;background:var(--panel);border:1px solid var(--border);border-radius:14px;padding:1.75rem;box-shadow:0 20px 50px rgba(0,0,0,.4)}
+h1,h2,h3{margin:0 0 .75rem;font-weight:600}
+.sub{color:var(--muted);font-size:.9rem;margin-bottom:1.25rem}
+label{display:block;font-size:.82rem;color:var(--muted);margin:.75rem 0 .25rem}
+input,select{width:100%;padding:.6rem .75rem;border-radius:8px;border:1px solid var(--border);background:var(--bg);color:var(--text);font-size:.95rem}
+input[type=checkbox]{width:auto;margin-right:.5rem}
+button{background:var(--accent);color:#082f49;border:0;border-radius:8px;padding:.6rem 1.05rem;font-weight:600;cursor:pointer;font-size:.9rem}
+button:hover{filter:brightness(1.08)}
+button.sec{background:var(--card);color:var(--text);border:1px solid var(--border)}
+button.warn{background:var(--warn);color:#111827}
+button.err{background:var(--err);color:#fff}
+.msg{margin-top:.8rem;font-size:.88rem;padding:.55rem .75rem;border-radius:8px;background:rgba(56,189,248,.12);border:1px solid rgba(56,189,248,.3)}
+.msg.err{background:rgba(239,68,68,.15);border-color:rgba(239,68,68,.4);color:#fecaca}
+.msg.ok{background:rgba(34,197,94,.15);border-color:rgba(34,197,94,.4);color:#bbf7d0}
+.layout{display:grid;grid-template-columns:220px 1fr;min-height:100vh}
+.side{background:var(--panel);border-right:1px solid var(--border);padding:1rem;display:flex;flex-direction:column;gap:.35rem}
+.brand{font-weight:700;font-size:1.05rem;color:var(--accent);padding:.4rem .5rem .9rem;border-bottom:1px solid var(--border);margin-bottom:.4rem}
+.nav{background:transparent;color:var(--muted);text-align:left;padding:.55rem .75rem;border-radius:8px;font-weight:500}
+.nav.active,.nav:hover{background:var(--card);color:var(--text)}
+.main{padding:1.5rem;max-width:1020px;width:100%}
+.banner{background:rgba(245,158,11,.15);border:1px solid var(--warn);border-radius:10px;padding:.85rem 1rem;margin-bottom:1rem;display:flex;align-items:center;justify-content:space-between;gap:.75rem;flex-wrap:wrap}
+.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:.9rem;margin-bottom:1.25rem}
+.card{background:var(--panel);border:1px solid var(--border);border-radius:12px;padding:1.1rem}
+.k{font-size:.75rem;text-transform:uppercase;letter-spacing:.05em;color:var(--muted)}
+.v{font-size:1.25rem;font-weight:600;margin-top:.25rem}
+.row{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:.85rem}
+.actions{margin-top:1.1rem;display:flex;gap:.6rem;flex-wrap:wrap;align-items:center}
+table{width:100%;border-collapse:collapse;font-size:.88rem;margin-top:.5rem}
+th,td{text-align:left;padding:.45rem .5rem;border-bottom:1px solid var(--border)}
+th{color:var(--muted);font-weight:500}
+@media(max-width:740px){.layout{grid-template-columns:1fr}.side{flex-direction:row;overflow-x:auto;border-right:0;border-bottom:1px solid var(--border)}.brand{display:none}}
+</style>
+</head>
+<body>
+<div id="view-setup" class="center hidden">
+  <div class="auth-box">
+    <h1>RV180W Quick Setup</h1>
+    <div class="sub">First-boot setup. Credentials are hashed (PBKDF2-SHA256) and fsynced atomically to flash.</div>
+    <label>Admin Username</label><input id="s-user" value="admin">
+    <label>Admin Password (min 6 chars)</label><input id="s-pass" type="password" placeholder="Enter strong password">
+    <div class="actions"><button onclick="doSetup()">Save &amp; Enter Dashboard</button></div>
+    <div id="s-msg" class="msg hidden"></div>
+  </div>
+</div>
+
+<div id="view-login" class="center hidden">
+  <div class="auth-box">
+    <h1>Cisco RV180W Next</h1>
+    <div class="sub">Pure-Rust Control Plane &middot; TLS 1.2/1.3 &middot; Zero-Reboot Hot-Reload</div>
+    <label>Username</label><input id="l-user" value="admin">
+    <label>Password</label><input id="l-pass" type="password" onkeydown="if(event.key==='Enter')doLogin()">
+    <div class="actions"><button onclick="doLogin()">Sign In</button></div>
+    <div id="l-msg" class="msg hidden"></div>
+  </div>
+</div>
+
+<div id="view-app" class="layout hidden">
+  <aside class="side">
+    <div class="brand">RV180W Next v3</div>
+    <button class="nav active" data-tab="overview" onclick="tab('overview')">Overview</button>
+    <button class="nav" data-tab="network" onclick="tab('network')">Network (WAN/LAN)</button>
+    <button class="nav" data-tab="wifi" onclick="tab('wifi')">Wireless 2.4G</button>
+    <button class="nav" data-tab="dhcp" onclick="tab('dhcp')">DHCP &amp; DNS</button>
+    <button class="nav" data-tab="firewall" onclick="tab('firewall')">Firewall &amp; QoS</button>
+    <button class="nav" data-tab="vpn" onclick="tab('vpn')">VPN (On-Demand)</button>
+    <button class="nav" data-tab="system" onclick="tab('system')">System &amp; Auth</button>
+    <div style="margin-top:auto;padding-top:1rem"><button class="sec" style="width:100%" onclick="doLogout()">Logout</button></div>
+  </aside>
+  <main class="main">
+    <div id="rb-banner" class="banner hidden">
+      <div><strong>Safe-Mode Guard:</strong> Network/Firewall changed without reboot. Auto-rollback in <span id="rb-secs">60</span>s unless confirmed.</div>
+      <div style="display:flex;gap:.5rem">
+        <button onclick="confirmChanges()">Confirm Changes</button>
+        <button class="err" onclick="rollbackNow()">Rollback Now</button>
+      </div>
+    </div>
+    <div id="toast" class="msg hidden" style="margin-top:0;margin-bottom:1rem"></div>
+
+    <section id="tab-overview">
+      <h2>Live System Overview</h2>
+      <div class="grid">
+        <div class="card"><div class="k">Version</div><div class="v" id="d-ver">-</div></div>
+        <div class="card"><div class="k">Uptime</div><div class="v" id="d-up">-</div></div>
+        <div class="card"><div class="k">CPU Load</div><div class="v" id="d-load">-</div></div>
+        <div class="card"><div class="k">RAM Free / Total</div><div class="v" id="d-ram">-</div></div>
+      </div>
+      <div class="card" style="margin-bottom:1rem">
+        <h3>Network Interfaces</h3>
+        <table><thead><tr><th>Interface</th><th>State</th><th>RX</th><th>TX</th></tr></thead><tbody id="d-ifaces"></tbody></table>
+      </div>
+      <div class="card">
+        <h3>Active DHCP Leases</h3>
+        <table><thead><tr><th>IP</th><th>MAC</th><th>Hostname</th></tr></thead><tbody id="d-leases"></tbody></table>
+      </div>
+    </section>
+
+    <section id="tab-network" class="hidden">
+      <div class="card">
+        <h2>Network (Zero-Reboot Hot-Reload)</h2>
+        <div class="row">
+          <div><label>LAN IP Address</label><input id="c-lan-ip"></div>
+          <div><label>LAN Netmask</label><input id="c-lan-mask"></div>
+          <div><label>WAN Mode</label><select id="c-wan-mode"><option value="dhcp">DHCP</option><option value="static">Static IP</option><option value="pppoe">PPPoE</option></select></div>
+          <div><label>WAN Static IP</label><input id="c-wan-ip" placeholder="optional"></div>
+          <div><label>WAN Static Netmask</label><input id="c-wan-mask" placeholder="255.255.255.0"></div>
+          <div><label>WAN Gateway</label><input id="c-wan-gw" placeholder="optional"></div>
+        </div>
+        <div class="actions"><button onclick="saveConfig()">Apply Network (No Reboot)</button></div>
+      </div>
+    </section>
+
+    <section id="tab-wifi" class="hidden">
+      <div class="card">
+        <h2>Wireless 2.4 GHz (Atheros 802.11n)</h2>
+        <div class="row">
+          <div><label><input type="checkbox" id="c-wifi-en">Enable Wi-Fi</label></div>
+          <div><label>SSID</label><input id="c-wifi-ssid"></div>
+          <div><label>Channel (1-13)</label><input id="c-wifi-ch" type="number" min="1" max="13"></div>
+          <div><label>Security</label><select id="c-wifi-sec"><option value="wpa2_psk">WPA2-PSK (AES)</option><option value="open">Open</option></select></div>
+          <div><label>WPA2 Passphrase</label><input id="c-wifi-pass" type="password"></div>
+        </div>
+        <div class="actions"><button onclick="saveConfig()">Apply Wireless (No Reboot)</button></div>
+      </div>
+    </section>
+
+    <section id="tab-dhcp" class="hidden">
+      <div class="card">
+        <h2>DHCP &amp; DNS (dnsmasq)</h2>
+        <div class="row">
+          <div><label><input type="checkbox" id="c-dhcp-en">Enable DHCP Server</label></div>
+          <div><label>Pool Start</label><input id="c-dhcp-start"></div>
+          <div><label>Pool End</label><input id="c-dhcp-end"></div>
+          <div><label>Lease Minutes</label><input id="c-dhcp-lease" type="number"></div>
+          <div><label>Upstream DNS (comma-separated)</label><input id="c-dns" placeholder="1.1.1.1,8.8.8.8"></div>
+        </div>
+        <div class="actions"><button onclick="saveConfig()">Apply DHCP/DNS (No Reboot)</button></div>
+      </div>
+    </section>
+
+    <section id="tab-firewall" class="hidden">
+      <div class="card">
+        <h2>Firewall &amp; QoS</h2>
+        <div class="row">
+          <div><label><input type="checkbox" id="c-fw-deny">Default-Deny WAN Ingress (Recommended)</label></div>
+          <div><label><input type="checkbox" id="c-qos-en">Enable Software QoS (SFQ; disables HW NAT)</label></div>
+        </div>
+        <div class="actions"><button onclick="saveConfig()">Apply Firewall/QoS (No Reboot)</button></div>
+      </div>
+    </section>
+
+    <section id="tab-vpn" class="hidden">
+      <div class="card">
+        <h2>VPN Services (Strictly On-Demand &mdash; 0 RAM when off)</h2>
+        <label><input type="checkbox" id="c-vpn-ipsec">Enable IPsec (racoon)</label>
+        <label><input type="checkbox" id="c-vpn-pptp">Enable PPTP Server</label>
+        <label><input type="checkbox" id="c-vpn-l2tp">Enable L2TP</label>
+        <div class="actions"><button onclick="saveConfig()">Apply VPN (No Reboot)</button></div>
+      </div>
+    </section>
+
+    <section id="tab-system" class="hidden">
+      <div class="card" style="margin-bottom:1rem">
+        <h2>System Settings</h2>
+        <div class="row">
+          <div><label>Hostname</label><input id="c-host"></div>
+          <div><label>Timezone</label><input id="c-tz"></div>
+          <div><label><input type="checkbox" id="c-ntp">Enable NTP</label></div>
+          <div><label><input type="checkbox" id="c-wan-mgmt">Allow HTTPS Mgmt from WAN</label></div>
+        </div>
+        <div class="actions"><button onclick="saveConfig()">Apply System (No Reboot)</button></div>
+      </div>
+      <div class="card">
+        <h2>Change Admin Password</h2>
+        <div class="row">
+          <div><label>Current Password</label><input id="p-old" type="password"></div>
+          <div><label>New Password (min 6 chars)</label><input id="p-new" type="password"></div>
+        </div>
+        <div class="actions"><button onclick="changePassword()">Update Password</button></div>
+      </div>
+    </section>
+  </main>
+</div>
+
+<script>
+let CSRF = '', CFG = null, pollTimer = null;
+const $ = id => document.getElementById(id);
+function show(view){ ['view-setup','view-login','view-app'].forEach(v=>$(v).classList.toggle('hidden', v!==view)); }
+function toast(text, cls='ok'){ const t=$('toast'); t.textContent=text; t.className='msg '+cls; t.classList.remove('hidden'); setTimeout(()=>t.classList.add('hidden'), 6000); }
+function fmtBytes(b){ if(b>1048576) return (b/1048576).toFixed(1)+' MB'; if(b>1024) return (b/1024).toFixed(1)+' KB'; return b+' B'; }
+
+async function api(path, method='GET', body=null){
+  const opts={method, headers:{'Content-Type':'application/json'}};
+  if(CSRF) opts.headers['X-CSRF-Token']=CSRF;
+  if(body!==null) opts.body=JSON.stringify(body);
+  const r=await fetch(path, opts);
+  const d=await r.json().catch(()=>({}));
+  if(!r.ok) throw new Error(d.error || ('HTTP '+r.status));
+  return d;
+}
+
+async function init(){
+  const st = await api('/api/v1/auth/status');
+  if(!st.initialized){ show('view-setup'); return; }
+  if(!st.authenticated){ show('view-login'); return; }
+  CSRF = st.csrf_token || '';
+  show('view-app');
+  await loadAll();
+}
+
+async function doSetup(){
+  try{
+    const d = await api('/api/v1/auth/setup','POST',{username:$('s-user').value,password:$('s-pass').value});
+    CSRF = d.csrf_token; show('view-app'); await loadAll();
+    toast('Admin account saved atomically to flash!');
+  }catch(e){ $('s-msg').textContent=e.message; $('s-msg').className='msg err'; $('s-msg').classList.remove('hidden'); }
+}
+
+async function doLogin(){
+  try{
+    const d = await api('/api/v1/auth/login','POST',{username:$('l-user').value,password:$('l-pass').value});
+    CSRF = d.csrf_token; show('view-app'); await loadAll();
+  }catch(e){ $('l-msg').textContent=e.message; $('l-msg').className='msg err'; $('l-msg').classList.remove('hidden'); }
+}
+
+async function doLogout(){
+  try{ await api('/api/v1/auth/logout','POST',{}); }catch(_){}
+  if(pollTimer) clearInterval(pollTimer);
+  CSRF=''; show('view-login');
+}
+
+function tab(name){
+  document.querySelectorAll('.nav').forEach(b=>b.classList.toggle('active', b.dataset.tab===name));
+  ['overview','network','wifi','dhcp','firewall','vpn','system'].forEach(t=>$('tab-'+t).classList.toggle('hidden', t!==name));
+}
+
+async function loadAll(){
+  CFG = await api('/api/v1/config');
+  fillForms(CFG);
+  await refreshDashboard();
+  if(pollTimer) clearInterval(pollTimer);
+  pollTimer = setInterval(refreshDashboard, 5000);
+}
+
+async function refreshDashboard(){
+  try{
+    const d = await api('/api/v1/dashboard');
+    $('d-ver').textContent = 'v'+d.version;
+    const t = d.telemetry;
+    $('d-up').textContent = t.uptime_sec ? Math.floor(t.uptime_sec)+'s' : '-';
+    $('d-load').textContent = t.loadavg || '-';
+    $('d-ram').textContent = (t.mem_available_kb||0)+' / '+(t.mem_total_kb||0)+' KB';
+    $('d-ifaces').innerHTML = (t.interfaces||[]).map(i=>`<tr><td>${i.name}</td><td>${i.operstate}</td><td>${fmtBytes(i.rx_bytes)}</td><td>${fmtBytes(i.tx_bytes)}</td></tr>`).join('') || '<tr><td colspan="4">No interfaces</td></tr>';
+    $('d-leases').innerHTML = (t.dhcp_leases||[]).map(l=>`<tr><td>${l.ip}</td><td>${l.mac}</td><td>${l.hostname}</td></tr>`).join('') || '<tr><td colspan="3">No active leases</td></tr>';
+    if(d.rollback_pending_secs !== null && d.rollback_pending_secs !== undefined){
+      $('rb-secs').textContent = d.rollback_pending_secs;
+      $('rb-banner').classList.remove('hidden');
+    } else {
+      $('rb-banner').classList.add('hidden');
+    }
+  }catch(_){}
+}
+
+function fillForms(c){
+  $('c-lan-ip').value = c.network.lan.ip;
+  $('c-lan-mask').value = c.network.lan.netmask;
+  $('c-wan-mode').value = c.network.wan.mode;
+  $('c-wan-ip').value = c.network.wan.static_ip || '';
+  $('c-wan-mask').value = c.network.wan.static_netmask || '';
+  $('c-wan-gw').value = c.network.wan.static_gateway || '';
+  $('c-wifi-en').checked = c.wifi.enabled;
+  $('c-wifi-ssid').value = c.wifi.ssid;
+  $('c-wifi-ch').value = c.wifi.channel;
+  $('c-wifi-sec').value = c.wifi.security.mode;
+  $('c-wifi-pass').value = c.wifi.security.passphrase || '';
+  $('c-dhcp-en').checked = c.dhcp_dns.dhcp_enabled;
+  $('c-dhcp-start').value = c.dhcp_dns.range_start;
+  $('c-dhcp-end').value = c.dhcp_dns.range_end;
+  $('c-dhcp-lease').value = c.dhcp_dns.lease_time_minutes;
+  $('c-dns').value = (c.dhcp_dns.dns_servers||[]).join(',');
+  $('c-fw-deny').checked = c.firewall.default_wan_ingress_deny;
+  $('c-qos-en').checked = c.qos.enabled;
+  $('c-vpn-ipsec').checked = c.vpn.ipsec_enabled;
+  $('c-vpn-pptp').checked = c.vpn.pptp_enabled;
+  $('c-vpn-l2tp').checked = c.vpn.l2tp_enabled;
+  $('c-host').value = c.system.hostname;
+  $('c-tz').value = c.system.timezone;
+  $('c-ntp').checked = c.system.ntp_enabled;
+  $('c-wan-mgmt').checked = c.system.remote_mgmt_wan;
+}
+
+async function saveConfig(){
+  const c = structuredClone(CFG);
+  c.network.lan.ip = $('c-lan-ip').value.trim();
+  c.network.lan.netmask = $('c-lan-mask').value.trim();
+  c.network.wan.mode = $('c-wan-mode').value;
+  c.network.wan.static_ip = $('c-wan-ip').value.trim() || null;
+  c.network.wan.static_netmask = $('c-wan-mask').value.trim() || null;
+  c.network.wan.static_gateway = $('c-wan-gw').value.trim() || null;
+  c.wifi.enabled = $('c-wifi-en').checked;
+  c.wifi.ssid = $('c-wifi-ssid').value.trim();
+  c.wifi.channel = parseInt($('c-wifi-ch').value,10)||6;
+  c.wifi.security.mode = $('c-wifi-sec').value;
+  c.wifi.security.passphrase = $('c-wifi-pass').value || null;
+  c.dhcp_dns.dhcp_enabled = $('c-dhcp-en').checked;
+  c.dhcp_dns.range_start = $('c-dhcp-start').value.trim();
+  c.dhcp_dns.range_end = $('c-dhcp-end').value.trim();
+  c.dhcp_dns.lease_time_minutes = parseInt($('c-dhcp-lease').value,10)||1440;
+  c.dhcp_dns.dns_servers = $('c-dns').value.split(',').map(s=>s.trim()).filter(Boolean);
+  c.firewall.default_wan_ingress_deny = $('c-fw-deny').checked;
+  c.qos.enabled = $('c-qos-en').checked;
+  c.vpn.ipsec_enabled = $('c-vpn-ipsec').checked;
+  c.vpn.pptp_enabled = $('c-vpn-pptp').checked;
+  c.vpn.l2tp_enabled = $('c-vpn-l2tp').checked;
+  c.system.hostname = $('c-host').value.trim();
+  c.system.timezone = $('c-tz').value.trim();
+  c.system.ntp_enabled = $('c-ntp').checked;
+  c.system.remote_mgmt_wan = $('c-wan-mgmt').checked;
+  try{
+    const res = await api('/api/v1/config','PUT',c);
+    CFG = c;
+    toast('Applied ['+(res.applied_subsystems.join(', ')||'no changes')+'] with ZERO reboot!');
+    await refreshDashboard();
+  }catch(e){ toast(e.message,'err'); }
+}
+
+async function confirmChanges(){
+  try{ await api('/api/v1/config/confirm','POST',{}); $('rb-banner').classList.add('hidden'); toast('Changes confirmed & locked permanently.'); }
+  catch(e){ toast(e.message,'err'); }
+}
+
+async function rollbackNow(){
+  try{ await api('/api/v1/config/rollback','POST',{}); await loadAll(); toast('Rolled back to previous backup config.'); }
+  catch(e){ toast(e.message,'err'); }
+}
+
+async function changePassword(){
+  try{
+    await api('/api/v1/auth/password','POST',{current_password:$('p-old').value,new_password:$('p-new').value});
+    $('p-old').value=''; $('p-new').value='';
+    toast('Admin password updated & fsynced to flash!');
+  }catch(e){ toast(e.message,'err'); }
+}
+
+init();
+</script>
+</body>
+</html>
