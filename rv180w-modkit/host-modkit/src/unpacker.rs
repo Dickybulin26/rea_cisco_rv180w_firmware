@@ -1,5 +1,5 @@
 use std::fs::{self, File};
-use std::io::{BufReader, Cursor, Read};
+use std::io::{BufReader, BufWriter, Cursor, Read};
 use std::os::unix::fs::{symlink, PermissionsExt};
 use std::path::{Component, Path, PathBuf};
 
@@ -147,6 +147,134 @@ pub fn verify_firmware_bytes(data: &[u8]) -> Result<VendorHeader> {
     Ok(hdr)
 }
 
+/// Deep compatibility checks for a packed RV180W image:
+/// - SquashFS `hsqs` at 0x600000
+/// - SquashFS 4.0 LE gzip 128 KiB, no xattr table, no COMP_OPT flag
+/// - 64 KiB NOR eraseblock alignment of SquashFS segment end (before 512-byte trailer)
+/// - Trailer `FWCHKADDISABABA` in last 512 bytes
+pub fn verify_packed_image_compat(data: &[u8]) -> Result<()> {
+    if data.len() < KERNEL_PARTITION_SIZE + TRAILER_LEN {
+        bail!("image too small for RV180W layout");
+    }
+    if &data[KERNEL_PARTITION_SIZE..KERNEL_PARTITION_SIZE + 4] != b"hsqs" {
+        bail!("SquashFS magic 'hsqs' not found at offset 0x{:x}", KERNEL_PARTITION_SIZE);
+    }
+
+    let trailer_off = data.len() - TRAILER_LEN;
+    let trailer = &data[trailer_off..];
+    let trailer_magic = cstr_from_fixed(trailer).trim().to_string();
+    if trailer_magic != "FWCHKADDISABABA" {
+        bail!(
+            "invalid trailer magic at end of image: expected 'FWCHKADDISABABA', got {:?}",
+            trailer_magic
+        );
+    }
+
+    // SquashFS segment occupies [0x600000 .. trailer_off) and must be 64 KiB-aligned in total image layout
+    // (i.e. trailer starts at a 64 KiB-aligned boundary).
+    if trailer_off % 0x1_0000 != 0 {
+        bail!(
+            "SquashFS segment end/trailer offset 0x{:x} is not 64 KiB aligned (0x10000)",
+            trailer_off
+        );
+    }
+
+    let squashfs_slice = &data[KERNEL_PARTITION_SIZE..trailer_off];
+    validate_squashfs_kernel_compat(squashfs_slice)?;
+    Ok(())
+}
+
+/// Verify ARMv6 ELF attributes for injected binaries inside the image squashfs (best-effort).
+/// Checks Tag_CPU_arch == v6, no Tag_FP_arch (soft-float), no Thumb-2.
+pub fn verify_embedded_armv6_binaries(data: &[u8]) -> Result<Vec<String>> {
+    let trailer_off = data.len().checked_sub(TRAILER_LEN).ok_or_else(|| anyhow!("image too small"))?;
+    let squashfs_slice = &data[KERNEL_PARTITION_SIZE..trailer_off];
+    let reader = FilesystemReader::from_reader(BufReader::new(Cursor::new(squashfs_slice)))
+        .context("failed to read squashfs for ELF verification")?;
+
+    let mut checked = Vec::new();
+    for path in ["/bin/rv180wd", "/bin/modern-tls-proxy"] {
+        let file = match reader.files().find(|n| n.fullpath.to_string_lossy() == path) {
+            Some(n) => n,
+            None => continue,
+        };
+        if let InnerNode::File(f) = &file.inner {
+            let mut buf = Vec::new();
+            let mut r = reader.file(f).reader();
+            r.read_to_end(&mut buf)?;
+            validate_armv6_elf(&buf, path)?;
+            checked.push(path.to_string());
+        }
+    }
+    Ok(checked)
+}
+
+fn validate_armv6_elf(bytes: &[u8], name: &str) -> Result<()> {
+    if bytes.len() < 20 || &bytes[0..4] != b"\x7fELF" {
+        bail!("{name}: not an ELF binary");
+    }
+    if bytes[4] != 1 {
+        bail!("{name}: not ELF32 (class={})", bytes[4]);
+    }
+    let e_machine = u16::from_le_bytes([bytes[18], bytes[19]]);
+    if e_machine != 40 {
+        bail!("{name}: not ARM ELF (machine={e_machine})");
+    }
+
+    // Prefer host readelf -A for authoritative ARM attribute parsing.
+    if let Ok(out) = std::process::Command::new("readelf")
+        .args(["-A", "/dev/stdin"])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .and_then(|mut child| {
+            if let Some(mut stdin) = child.stdin.take() {
+                let _ = std::io::Write::write_all(&mut stdin, bytes);
+            }
+            child.wait_with_output()
+        })
+    {
+        if out.status.success() {
+            let s = String::from_utf8_lossy(&out.stdout);
+            // Tag_CPU_arch: v6 / v6K / v6KZ etc. acceptable for arm11mpcore; reject v7+
+            if let Some(line) = s.lines().find(|l| l.contains("Tag_CPU_arch")) {
+                if line.contains("v7") || line.contains("v8") {
+                    bail!("{name}: ARM attributes indicate incompatible CPU arch: {}", line.trim());
+                }
+                if !line.contains("v6") && !line.contains("v5") {
+                    // if present but not v6-ish, be cautious
+                    eprintln!("[verify] warning: {name} {}", line.trim());
+                }
+            }
+            if s.contains("Tag_FP_arch") {
+                bail!("{name}: contains Tag_FP_arch (VFP/FPU) but target requires soft-float");
+            }
+            if s.contains("Tag_THUMB_ISA_use: Thumb-2") {
+                bail!("{name}: contains Thumb-2 ISA use; arm11mpcore/2.6.31 target expects ARMv6");
+            }
+            return Ok(());
+        }
+    }
+
+    // Fallback heuristic: scan for obvious markers in .ARM.attributes bytes if readelf unavailable.
+    let hay = String::from_utf8_lossy(bytes);
+    if hay.contains("v7") && hay.contains("Tag_CPU_arch") {
+        bail!("{name}: heuristic detected possible ARMv7 attributes");
+    }
+    Ok(())
+}
+
+pub fn verify_firmware_deep(data: &[u8]) -> Result<VendorHeader> {
+    let hdr = verify_firmware_bytes(data)?;
+    verify_packed_image_compat(data)?;
+    let checked = verify_embedded_armv6_binaries(data)?;
+    if !checked.is_empty() {
+        eprintln!("[verify] ARMv6 ELF checks passed for: {}", checked.join(", "));
+    }
+    Ok(hdr)
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SquashFsInfo {
     pub offset: usize,
@@ -159,6 +287,182 @@ pub struct SquashFsInfo {
     pub inode_count: u32,
     pub mkfs_time: u32,
     pub endianness: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct SquashfsCompatInfo {
+    pub version_major: u16,
+    pub version_minor: u16,
+    pub compression_id: u16,
+    pub block_size: u32,
+    pub flags: u16,
+    pub xattr_id_table_start: u64,
+    pub bytes_used: u64,
+}
+
+pub fn read_squashfs_superblock(bytes: &[u8]) -> Result<SquashfsCompatInfo> {
+    if bytes.len() < 96 {
+        bail!("buffer too small for SquashFS superblock");
+    }
+    let magic = &bytes[0..4];
+    if magic != b"hsqs" {
+        bail!("invalid SquashFS magic: {:02x?} (expected 'hsqs')", magic);
+    }
+    Ok(SquashfsCompatInfo {
+        version_major: u16::from_le_bytes(bytes[28..30].try_into().unwrap()),
+        version_minor: u16::from_le_bytes(bytes[30..32].try_into().unwrap()),
+        compression_id: u16::from_le_bytes(bytes[20..22].try_into().unwrap()),
+        block_size: u32::from_le_bytes(bytes[12..16].try_into().unwrap()),
+        flags: u16::from_le_bytes(bytes[22..24].try_into().unwrap()),
+        bytes_used: u64::from_le_bytes(bytes[40..48].try_into().unwrap()),
+        xattr_id_table_start: u64::from_le_bytes(bytes[80..88].try_into().unwrap()),
+    })
+}
+
+/// Validate SquashFS is compatible with Linux 2.6.31.1-cavm1 (4.0 LE gzip 128KiB, no xattrs/COMP_OPT).
+pub fn validate_squashfs_kernel_compat(bytes: &[u8]) -> Result<SquashfsCompatInfo> {
+    let sb = read_squashfs_superblock(bytes)?;
+    if sb.version_major != 4 || sb.version_minor != 0 {
+        bail!(
+            "SquashFS version {}.{} is not 4.0 (required by Linux 2.6.31.1)",
+            sb.version_major,
+            sb.version_minor
+        );
+    }
+    if sb.compression_id != 1 {
+        bail!(
+            "SquashFS compression_id {} is not gzip(1) (required by Linux 2.6.31.1)",
+            sb.compression_id
+        );
+    }
+    if sb.block_size != 131072 {
+        bail!(
+            "SquashFS block_size {} is not 131072 (128 KiB)",
+            sb.block_size
+        );
+    }
+    if sb.xattr_id_table_start != 0xffff_ffff_ffff_ffff {
+        bail!(
+            "SquashFS has xattr table (0x{:016x}); Linux 2.6.31.1 does not support xattrs",
+            sb.xattr_id_table_start
+        );
+    }
+    const COMP_OPT: u16 = 0x0400;
+    if sb.flags & COMP_OPT != 0 {
+        bail!(
+            "SquashFS COMP_OPT flag set (flags=0x{:04x}); Linux 2.6.31.1 may reject it",
+            sb.flags
+        );
+    }
+    Ok(sb)
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PseudoNode {
+    pub path: String,
+    #[serde(rename = "type")]
+    pub node_type: String, // "dir", "char", "block", "fifo", "socket"
+    pub mode: u16,
+    pub uid: u16,
+    pub gid: u16,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub major: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub minor: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub device_number: Option<u32>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct PseudoNodesFile {
+    pub nodes: Vec<PseudoNode>,
+}
+
+impl PseudoNodesFile {
+    pub fn path(work_dir: &Path) -> PathBuf {
+        work_dir.join("pseudo_nodes.json")
+    }
+
+    pub fn load(work_dir: &Path) -> Result<Self> {
+        let p = Self::path(work_dir);
+        if !p.exists() {
+            return Ok(Self::default());
+        }
+        let s = fs::read_to_string(&p)
+            .with_context(|| format!("failed to read {}", p.display()))?;
+        Ok(serde_json::from_str(&s)?)
+    }
+
+    pub fn save(&self, work_dir: &Path) -> Result<()> {
+        let p = Self::path(work_dir);
+        let f = File::create(&p).with_context(|| format!("failed to create {}", p.display()))?;
+        serde_json::to_writer_pretty(BufWriter::new(f), self)?;
+        Ok(())
+    }
+
+    /// Generate mksquashfs -pf pseudo file entries for special nodes and directory modes.
+    /// Format: https://github.com/plougher/squashfs-tools (pseudo file definitions)
+    pub fn write_mksquashfs_pf(&self, path: &Path) -> Result<()> {
+        let mut out = String::new();
+        for n in &self.nodes {
+            let rel = n.path.trim_start_matches('/');
+            if rel.is_empty() {
+                continue;
+            }
+            match n.node_type.as_str() {
+                "dir" => {
+                    // 'm' modifies attributes of existing path
+                    out.push_str(&format!(
+                        "{} m {:o} {} {}\n",
+                        rel, n.mode & 0o7777, n.uid, n.gid
+                    ));
+                }
+                "char" => {
+                    let maj = n.major.unwrap_or(0);
+                    let min = n.minor.unwrap_or(0);
+                    out.push_str(&format!(
+                        "{} c {:o} {} {} {} {}\n",
+                        rel, n.mode & 0o7777, n.uid, n.gid, maj, min
+                    ));
+                }
+                "block" => {
+                    let maj = n.major.unwrap_or(0);
+                    let min = n.minor.unwrap_or(0);
+                    out.push_str(&format!(
+                        "{} b {:o} {} {} {} {}\n",
+                        rel, n.mode & 0o7777, n.uid, n.gid, maj, min
+                    ));
+                }
+                "fifo" => {
+                    out.push_str(&format!(
+                        "{} p {:o} {} {}\n",
+                        rel, n.mode & 0o7777, n.uid, n.gid
+                    ));
+                }
+                "socket" => {
+                    out.push_str(&format!(
+                        "{} s {:o} {} {}\n",
+                        rel, n.mode & 0o7777, n.uid, n.gid
+                    ));
+                }
+                _ => {}
+            }
+        }
+        if let Some(parent) = path.parent() {
+            if !parent.as_os_str().is_empty() {
+                fs::create_dir_all(parent)?;
+            }
+        }
+        fs::write(path, out).with_context(|| format!("failed to write {}", path.display()))?;
+        Ok(())
+    }
+}
+
+/// Decode Linux/SquashFS 4.0 device number to (major, minor).
+pub fn decode_dev(dev: u32) -> (u32, u32) {
+    let major = (dev & 0xfff00) >> 8;
+    let minor = (dev & 0xff) | ((dev >> 12) & 0xfff00);
+    (major, minor)
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -183,6 +487,8 @@ pub struct UnpackManifest {
     pub extracted_files: usize,
     pub extracted_dirs: usize,
     pub extracted_symlinks: usize,
+    #[serde(default)]
+    pub extracted_special_nodes: usize,
 }
 
 fn find_pattern(haystack: &[u8], needle: &[u8], start: usize) -> Option<usize> {
@@ -332,8 +638,10 @@ pub fn unpack_firmware(input_path: &Path, work_dir: &Path) -> Result<UnpackManif
     let mut file_count = 0usize;
     let mut dir_count = 0usize;
     let mut symlink_count = 0usize;
+    let mut special_count = 0usize;
+    let mut pseudo = PseudoNodesFile::default();
 
-    // Pass 1: directories first so parent dirs exist
+    // Pass 1: directories first so parent dirs exist (keep writable for extraction)
     for node in fs_reader.files() {
         if let InnerNode::Dir(_) = &node.inner {
             let rel = sanitize_rel_path(&node.fullpath)?;
@@ -342,17 +650,32 @@ pub fn unpack_firmware(input_path: &Path, work_dir: &Path) -> Result<UnpackManif
             }
             let target = root_out.join(&rel);
             fs::create_dir_all(&target)?;
+            let orig_mode = (node.header.permissions & 0o7777) as u16;
+            pseudo.nodes.push(PseudoNode {
+                path: format!("/{}", rel.display()),
+                node_type: "dir".to_string(),
+                mode: orig_mode,
+                uid: node.header.uid as u16,
+                gid: node.header.gid as u16,
+                major: None,
+                minor: None,
+                device_number: None,
+            });
             dir_count += 1;
         }
     }
 
-    // Pass 2: regular files and symlinks
+    // Pass 2: regular files, symlinks, and special nodes (record special nodes for repack)
     for node in fs_reader.files() {
         let rel = sanitize_rel_path(&node.fullpath)?;
         if rel.as_os_str().is_empty() {
             continue;
         }
         let target = root_out.join(&rel);
+        let path_str = format!("/{}", rel.display());
+        let mode = (node.header.permissions & 0o7777) as u16;
+        let uid = node.header.uid as u16;
+        let gid = node.header.gid as u16;
         match &node.inner {
             InnerNode::File(f) => {
                 if let Some(parent) = target.parent() {
@@ -361,8 +684,7 @@ pub fn unpack_firmware(input_path: &Path, work_dir: &Path) -> Result<UnpackManif
                 let mut reader = fs_reader.file(f).reader();
                 let mut out_file = File::create(&target)?;
                 std::io::copy(&mut reader, &mut out_file)?;
-                let mode = (node.header.permissions as u32) & 0o7777;
-                fs::set_permissions(&target, fs::Permissions::from_mode(mode))?;
+                fs::set_permissions(&target, fs::Permissions::from_mode(mode as u32))?;
                 file_count += 1;
             }
             InnerNode::Symlink(s) => {
@@ -376,16 +698,68 @@ pub fn unpack_firmware(input_path: &Path, work_dir: &Path) -> Result<UnpackManif
                 symlink_count += 1;
             }
             InnerNode::Dir(_) => {}
-            other => {
-                eprintln!(
-                    "[unpacker] skipping unsupported special node {:?} at {:?}",
-                    other, rel
-                );
+            InnerNode::CharacterDevice(dev) => {
+                let (maj, min) = decode_dev(dev.device_number);
+                pseudo.nodes.push(PseudoNode {
+                    path: path_str,
+                    node_type: "char".to_string(),
+                    mode,
+                    uid,
+                    gid,
+                    major: Some(maj),
+                    minor: Some(min),
+                    device_number: Some(dev.device_number),
+                });
+                special_count += 1;
+            }
+            InnerNode::BlockDevice(dev) => {
+                let (maj, min) = decode_dev(dev.device_number);
+                pseudo.nodes.push(PseudoNode {
+                    path: path_str,
+                    node_type: "block".to_string(),
+                    mode,
+                    uid,
+                    gid,
+                    major: Some(maj),
+                    minor: Some(min),
+                    device_number: Some(dev.device_number),
+                });
+                special_count += 1;
+            }
+            InnerNode::NamedPipe => {
+                pseudo.nodes.push(PseudoNode {
+                    path: path_str,
+                    node_type: "fifo".to_string(),
+                    mode,
+                    uid,
+                    gid,
+                    major: None,
+                    minor: None,
+                    device_number: None,
+                });
+                special_count += 1;
+            }
+            InnerNode::Socket => {
+                pseudo.nodes.push(PseudoNode {
+                    path: path_str,
+                    node_type: "socket".to_string(),
+                    mode,
+                    uid,
+                    gid,
+                    major: None,
+                    minor: None,
+                    device_number: None,
+                });
+                special_count += 1;
             }
         }
     }
 
-    // Pass 3: apply directory permissions after files are written (avoid read-only dir blocking writes)
+    // Persist special nodes / original metadata for repack (mksquashfs -pf and backhand replay)
+    pseudo.save(work_dir)?;
+    pseudo.write_mksquashfs_pf(&work_dir.join("pseudo_nodes.txt"))?;
+
+    // Pass 3: make extracted directories writable for patching (original modes preserved in pseudo_nodes.json)
     for node in fs_reader.files() {
         if let InnerNode::Dir(_) = &node.inner {
             let rel = sanitize_rel_path(&node.fullpath)?;
@@ -419,6 +793,7 @@ pub fn unpack_firmware(input_path: &Path, work_dir: &Path) -> Result<UnpackManif
         extracted_files: file_count,
         extracted_dirs: dir_count,
         extracted_symlinks: symlink_count,
+        extracted_special_nodes: special_count,
     };
 
     fs::write(

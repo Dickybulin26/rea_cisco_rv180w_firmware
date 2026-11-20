@@ -117,7 +117,10 @@ impl AppState {
         };
         let rolled = cfg_store::rollback_to_backup(&self.config_path)
             .map_err(|e| format!("rollback failed: {e}"))?;
-        let applied = reconciler::reconcile_subsystems(&rolled, &subsystems)?;
+        let (applied, warnings) = reconciler::reconcile_subsystems(&rolled, &subsystems);
+        for w in &warnings {
+            eprintln!("[rv180wd] rollback warning: {w}");
+        }
         *self.config.lock().unwrap() = rolled;
         Ok(applied)
     }
@@ -603,13 +606,7 @@ fn dispatch(state: &AppState, req: &HttpRequest, peer_ip: IpAddr, is_https: bool
             if let Err(e) = cfg_store::save_atomic(&state.config_path, &new_cfg) {
                 return HttpResponse::err("500 Internal Server Error", &format!("failed to save config: {e}"));
             }
-            let applied = match reconciler::reconcile_subsystems(&new_cfg, &changed) {
-                Ok(a) => a,
-                Err(e) => {
-                    let _ = cfg_store::rollback_to_backup(&state.config_path);
-                    return HttpResponse::err("500 Internal Server Error", &format!("hot-reload failed (rolled back): {e}"));
-                }
-            };
+            let (applied, warnings) = reconciler::reconcile_subsystems(&new_cfg, &changed);
             *state.config.lock().unwrap() = new_cfg;
 
             let risky = changed
@@ -631,6 +628,7 @@ fn dispatch(state: &AppState, req: &HttpRequest, peer_ip: IpAddr, is_https: bool
                     "ok": true,
                     "reboot_required": false,
                     "applied_subsystems": applied,
+                    "warnings": warnings,
                     "rollback_pending_secs": rollback_secs,
                 }),
             )

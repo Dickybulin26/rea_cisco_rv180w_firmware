@@ -1,6 +1,7 @@
 //! Zero-reboot diff-based subsystem reconcilers.
 //! Only changed subsystems are hot-reloaded (< 1s, zero router reboot).
 //! Optional services (QoS, VPN, NTP) consume 0 processes and 0 RAM when disabled.
+//! Boot must never be blocked by optional/non-fatal subsystem failures.
 
 use std::fs;
 use std::path::Path;
@@ -9,44 +10,37 @@ use crate::config::diff::Subsystem;
 use crate::config::schema::{Config, WanMode};
 use crate::hal;
 
-pub fn reconcile_subsystems(cfg: &Config, subsystems: &[Subsystem]) -> Result<Vec<String>, String> {
+pub fn reconcile_subsystems(cfg: &Config, subsystems: &[Subsystem]) -> (Vec<String>, Vec<String>) {
     let mut applied = Vec::new();
+    let mut warnings = Vec::new();
     for sub in subsystems {
-        match sub {
-            Subsystem::System => {
-                system::reconcile(cfg)?;
-                applied.push("system".to_string());
-            }
-            Subsystem::Network => {
-                network::reconcile(cfg)?;
-                applied.push("network".to_string());
-            }
-            Subsystem::DhcpDns => {
-                dhcp_dns::reconcile(cfg)?;
-                applied.push("dhcp_dns".to_string());
-            }
-            Subsystem::Wifi => {
-                wifi::reconcile(cfg)?;
-                applied.push("wifi".to_string());
-            }
-            Subsystem::Firewall => {
-                firewall::reconcile(cfg)?;
-                applied.push("firewall".to_string());
-            }
-            Subsystem::Qos => {
-                qos::reconcile(cfg)?;
-                applied.push("qos".to_string());
-            }
-            Subsystem::Vpn => {
-                vpn::reconcile(cfg)?;
-                applied.push("vpn".to_string());
+        let res = match sub {
+            Subsystem::System => system::reconcile(cfg),
+            Subsystem::Network => network::reconcile(cfg),
+            Subsystem::DhcpDns => dhcp_dns::reconcile(cfg),
+            Subsystem::Firewall => firewall::reconcile(cfg),
+            Subsystem::Wifi => wifi::reconcile(cfg),
+            Subsystem::Qos => qos::reconcile(cfg),
+            Subsystem::Vpn => vpn::reconcile(cfg),
+        };
+        match res {
+            Ok(()) => applied.push(format!("{sub:?}").to_lowercase()),
+            Err(e) => {
+                if is_optional_subsystem(*sub) {
+                    warnings.push(format!("{sub:?} (optional): {e}"));
+                    // mark as attempted/applied-with-warning for visibility
+                    applied.push(format!("{:?}(warn)", sub).to_lowercase());
+                } else {
+                    warnings.push(format!("{sub:?}: {e}"));
+                    applied.push(format!("{:?}(err)", sub).to_lowercase());
+                }
             }
         }
     }
-    Ok(applied)
+    (applied, warnings)
 }
 
-pub fn reconcile_all(cfg: &Config) -> Result<Vec<String>, String> {
+pub fn reconcile_all(cfg: &Config) -> (Vec<String>, Vec<String>) {
     reconcile_subsystems(
         cfg,
         &[
@@ -59,6 +53,10 @@ pub fn reconcile_all(cfg: &Config) -> Result<Vec<String>, String> {
             Subsystem::Vpn,
         ],
     )
+}
+
+fn is_optional_subsystem(sub: Subsystem) -> bool {
+    matches!(sub, Subsystem::Wifi | Subsystem::Qos | Subsystem::Vpn)
 }
 
 fn netmask_to_prefix(mask: &str) -> u8 {
@@ -90,24 +88,41 @@ pub mod system {
 pub mod network {
     use super::*;
 
+    /// Network reconcile: LAN configuration is critical for management access (192.168.1.1).
+    /// WAN, routes, and HW NAT toggles are best-effort/non-fatal so boot is never blocked.
     pub fn reconcile(cfg: &Config) -> Result<(), String> {
+        let mut warnings: Vec<String> = Vec::new();
+
         let _ = hal::switch::configure_wan_port();
 
-        // Configure LAN interface (eth0) without reboot
+        // --- Critical: LAN interface (eth0) must be configured for management access ---
         let prefix = netmask_to_prefix(&cfg.network.lan.netmask);
         let lan_cidr = format!("{}/{}", cfg.network.lan.ip, prefix);
+        let _ = hal::exec_cmd("/sbin/ifconfig", &["eth0", "up"]);
+        let _ = hal::exec_cmd("/pfrm2.0/bin/ip", &["link", "set", "eth0", "up"]);
         let _ = hal::exec_cmd("/pfrm2.0/bin/ip", &["addr", "flush", "dev", "eth0"]);
-        hal::exec_cmd("/pfrm2.0/bin/ip", &["addr", "add", &lan_cidr, "dev", "eth0"])?;
-        hal::exec_cmd("/pfrm2.0/bin/ip", &["link", "set", "eth0", "up"])?;
+        let mut lan_ok = false;
+        // Try iproute2 first, fall back to ifconfig
+        if hal::exec_cmd("/pfrm2.0/bin/ip", &["addr", "add", &lan_cidr, "dev", "eth0"]).is_ok() {
+            lan_ok = true;
+        } else if hal::exec_cmd("/sbin/ifconfig", &["eth0", &cfg.network.lan.ip, "netmask", &cfg.network.lan.netmask]).is_ok() {
+            lan_ok = true;
+        }
+        if !lan_ok && !hal::is_dry_run() {
+            return Err("failed to configure LAN IP on eth0".to_string());
+        }
 
-        // Configure WAN interface (eth1) without reboot
+        // --- Best-effort: WAN interface (eth1) ---
         let _ = hal::exec_cmd("/usr/bin/killall", &["-q", "dhclient"]);
         let _ = hal::exec_cmd("/usr/bin/killall", &["-q", "pppd"]);
         let _ = hal::exec_cmd("/pfrm2.0/bin/ip", &["link", "set", "eth1", "up"]);
+        let _ = hal::exec_cmd("/sbin/ifconfig", &["eth1", "up"]);
 
         match cfg.network.wan.mode {
             WanMode::Dhcp => {
-                let _ = hal::exec_cmd("/pfrm2.0/bin/dhclient", &["-nw", "eth1"]);
+                if let Err(e) = hal::exec_cmd("/pfrm2.0/bin/dhclient", &["-nw", "eth1"]) {
+                    warnings.push(format!("wan dhcp: {e}"));
+                }
             }
             WanMode::Static => {
                 if let (Some(ip), Some(mask)) =
@@ -115,7 +130,9 @@ pub mod network {
                 {
                     let wan_cidr = format!("{}/{}", ip, netmask_to_prefix(mask));
                     let _ = hal::exec_cmd("/pfrm2.0/bin/ip", &["addr", "flush", "dev", "eth1"]);
-                    hal::exec_cmd("/pfrm2.0/bin/ip", &["addr", "add", &wan_cidr, "dev", "eth1"])?;
+                    if let Err(e) = hal::exec_cmd("/pfrm2.0/bin/ip", &["addr", "add", &wan_cidr, "dev", "eth1"]) {
+                        warnings.push(format!("wan static addr: {e}"));
+                    }
                     if let Some(gw) = &cfg.network.wan.static_gateway {
                         let _ = hal::exec_cmd(
                             "/pfrm2.0/bin/ip",
@@ -125,17 +142,18 @@ pub mod network {
                 }
             }
             WanMode::Pppoe => {
-                // Rendered cleanly to /tmp/pppoe.opts (no shell interpolation)
                 if !hal::is_dry_run() {
                     let user = cfg.network.wan.pppoe_username.as_deref().unwrap_or("");
                     let opts = format!("plugin rp-pppoe.so eth1\nuser \"{user}\"\ndefaultroute\nusepeerdns\npersist\n");
                     let _ = fs::write("/tmp/pppoe.opts", opts);
                 }
-                let _ = hal::exec_cmd("/pfrm2.0/bin/pppd", &["file", "/tmp/pppoe.opts"]);
+                if let Err(e) = hal::exec_cmd("/pfrm2.0/bin/pppd", &["file", "/tmp/pppoe.opts"]) {
+                    warnings.push(format!("wan pppoe: {e}"));
+                }
             }
         }
 
-        // Apply static routes
+        // Apply static routes (best-effort)
         for r in &cfg.network.static_routes {
             if !r.destination.is_empty() && !r.gateway.is_empty() {
                 let dest = format!("{}/{}", r.destination, netmask_to_prefix(&r.netmask));
@@ -146,8 +164,12 @@ pub mod network {
             }
         }
 
-        // Enable HW NAT acceleration when QoS is off (SPPE conflicts with software tc QoS)
+        // Enable HW NAT acceleration when QoS is off (best-effort)
         let _ = hal::switch::set_hw_nat(!cfg.qos.enabled);
+
+        for w in &warnings {
+            eprintln!("[reconciler:network] warning: {w}");
+        }
         Ok(())
     }
 }
