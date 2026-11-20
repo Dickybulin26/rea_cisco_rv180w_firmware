@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "host-modkit",
     "target-tls-proxy",
+    "rv180wd",
 ]
 
 [profile.release]
