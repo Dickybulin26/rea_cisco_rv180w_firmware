@@ -240,11 +240,12 @@ mod tests {
         b[0..4].copy_from_slice(b"hsqs");
         b[12..16].copy_from_slice(&block_size.to_le_bytes());
         b[20..22].copy_from_slice(&compression_id.to_le_bytes());
-        b[22..24].copy_from_slice(&flags.to_le_bytes());
+        b[22..24].copy_from_slice(&17u16.to_le_bytes()); // block_log (log2(131072))
+        b[24..26].copy_from_slice(&flags.to_le_bytes());
         b[28..30].copy_from_slice(&4u16.to_le_bytes()); // major
         b[30..32].copy_from_slice(&0u16.to_le_bytes()); // minor
         b[40..48].copy_from_slice(&96u64.to_le_bytes()); // bytes_used
-        b[80..88].copy_from_slice(&xattr_table.to_le_bytes());
+        b[56..64].copy_from_slice(&xattr_table.to_le_bytes());
         b
     }
 

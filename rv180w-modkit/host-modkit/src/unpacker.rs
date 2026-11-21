@@ -313,9 +313,9 @@ pub fn read_squashfs_superblock(bytes: &[u8]) -> Result<SquashfsCompatInfo> {
         version_minor: u16::from_le_bytes(bytes[30..32].try_into().unwrap()),
         compression_id: u16::from_le_bytes(bytes[20..22].try_into().unwrap()),
         block_size: u32::from_le_bytes(bytes[12..16].try_into().unwrap()),
-        flags: u16::from_le_bytes(bytes[22..24].try_into().unwrap()),
+        flags: u16::from_le_bytes(bytes[24..26].try_into().unwrap()),
         bytes_used: u64::from_le_bytes(bytes[40..48].try_into().unwrap()),
-        xattr_id_table_start: u64::from_le_bytes(bytes[80..88].try_into().unwrap()),
+        xattr_id_table_start: u64::from_le_bytes(bytes[56..64].try_into().unwrap()),
     })
 }
 
