@@ -105,14 +105,22 @@ pub mod board {
 pub mod switch {
     use super::*;
 
-    /// Configure Cavium CNS3xxx PSE VLAN table & MAC2 WAN port (matches rcS hardware setup).
+    /// Configure Cavium CNS3xxx SPPE HW NAT (`sppe_ioctl sppe <enable|disable>`).
     pub fn set_hw_nat(enable: bool) -> Result<(), String> {
         let arg = if enable { "enable" } else { "disable" };
-        exec_cmd("/pfrm2.0/bin/sppe_ioctl", &[arg])
+        exec_cmd("/pfrm2.0/bin/sppe_ioctl", &["sppe", arg])
     }
 
     pub fn configure_wan_port() -> Result<(), String> {
         exec_cmd("/pfrm2.0/bin/set_wan_port_func", &["set", "2"])
+    }
+
+    pub fn enable_lan_switch_ports() {
+        if Path::new("/dev/bcm53980").exists() || is_dry_run() {
+            for port in ["0", "1", "2", "3"] {
+                let _ = exec_cmd("/pfrm2.0/bin/switchConfig", &["/dev/bcm53980", "port", "enable", port]);
+            }
+        }
     }
 
     pub fn read_iface_operstate(iface: &str) -> String {
@@ -132,8 +140,12 @@ pub mod wifi {
         channel: u8,
         enabled: bool,
     ) -> Result<(), String> {
+        if !is_dry_run() && !Path::new("/sbin/iwconfig").exists() {
+            eprintln!("[hal:wifi] /sbin/iwconfig not present on router (dot11d driver); skipping {iface}");
+            return Ok(());
+        }
         if !enabled {
-            let _ = exec_cmd("/sbin/ifconfig", &[iface, "down"]);
+            let _ = exec_cmd("/bin/busybox", &["ifconfig", iface, "down"]);
             return Ok(());
         }
         let ch_str = channel.to_string();
@@ -141,7 +153,7 @@ pub mod wifi {
         if channel > 0 {
             exec_cmd("/sbin/iwconfig", &[iface, "channel", &ch_str])?;
         }
-        exec_cmd("/sbin/ifconfig", &[iface, "up"])?;
+        exec_cmd("/bin/busybox", &["ifconfig", iface, "up"])?;
         Ok(())
     }
 }

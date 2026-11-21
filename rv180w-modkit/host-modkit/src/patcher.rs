@@ -360,35 +360,39 @@ if [ -r /proc/push_button ]; then
     RESET_HELD="$(cat /proc/push_button 2>/dev/null | tr -d '[:space:]')"
 fi
 if [ -f /data/rv180w/.legacy_boot ] || [ "$RESET_HELD" = "1" ]; then
-    echo "[rv180w-next] Failsafe triggered -> exec platformInit.legacy" >/tmp/rv180wd-boot.log 2>&1
+    echo "[rv180w-next] Failsafe triggered -> exec platformInit.legacy" >/dev/console
     exec /bin/sh /pfrm2.0/etc/platformInit.legacy
 fi
 
-echo "[rv180w-next] Fast-booting Cisco RV180W (Pure Rust control plane)..." >/tmp/rv180wd-boot.log
+echo "[rv180w-next] Fast-booting Cisco RV180W (Pure Rust control plane)..." | tee /tmp/rv180wd-boot.log >/dev/console
 
 KREL="$(uname -r 2>/dev/null)"
 
-# Essential hardware modules (idempotent; rcS may have loaded some already)
+# Essential hardware modules (idempotent; rcS loads cns3xxx/sppe/leds before platformInit)
+# NOTE: Do NOT run `vlan_table_func init` here — rcS already populated VLAN 1 (LAN) & VLAN 2 (WAN) MAC tables.
 for mod in \
     "/pfrm2.0/lib/modules/${KREL}/kernel/drivers/net/cns3xxx/cns3xxx.ko" \
     "/pfrm2.0/lib/modules/cns3xxx.ko" \
     "/pfrm2.0/lib/modules/${KREL}/kernel/drivers/net/cns3xxx/scm-led.ko" \
     "/pfrm2.0/lib/modules/${KREL}/kernel/drivers/net/cns3xxx/push_button.ko" \
     "/pfrm2.0/lib/modules/sppe.ko" \
-    "/pfrm2.0/lib/modules/swdrv/bcm5398.ko" \
     "/pfrm2.0/lib/modules/powerMode.ko"; do
     [ -f "$mod" ] && insmod "$mod" >/dev/null 2>&1 || true
 done
 
-# Ensure switch device node and basic VLAN/WAN port setup if helpers exist
-[ -c /dev/bcm53980 ] || { MAJ="$(awk '$2=="bcm5395"{print $1}' /proc/devices 2>/dev/null)"; [ -n "$MAJ" ] && mknod /dev/bcm53980 c "$MAJ" 0 2>/dev/null; }
-[ -x /pfrm2.0/bin/vlan_table_func ] && /pfrm2.0/bin/vlan_table_func init >/dev/null 2>&1 || true
-[ -x /pfrm2.0/bin/set_wan_port_func ] && /pfrm2.0/bin/set_wan_port_func set 2 >/dev/null 2>&1 || true
+# 1. Load Broadcom switch driver with exact bcmswitch="bcm5395" param & create /dev/bcm53980
+if [ -f /pfrm2.0/lib/modules/swdrv/bcm5398.ko ]; then
+    insmod /pfrm2.0/lib/modules/swdrv/bcm5398.ko bcmswitch="bcm5395" >/dev/console 2>&1 || true
+    BCM_MAJOR="$(awk '$2=="bcm5395" {print $1}' /proc/devices 2>/dev/null)"
+    if [ -n "$BCM_MAJOR" ] && [ ! -e /dev/bcm53980 ]; then
+        mknod /dev/bcm53980 c "$BCM_MAJOR" 0 2>/dev/null || true
+    fi
+fi
 
-# Bring up base interfaces (best-effort; reconciler will configure addresses)
-[ -x /sbin/ifconfig ] && { /sbin/ifconfig lo 127.0.0.1 up >/dev/null 2>&1 || true; /sbin/ifconfig eth0 up >/dev/null 2>&1 || true; /sbin/ifconfig eth1 up >/dev/null 2>&1 || true; }
+# Bring up loopback immediately
+/bin/busybox ifconfig lo 127.0.0.1 up >/dev/null 2>&1 || true
 
-# Wi-Fi Atheros MADWiFi modules (best-effort)
+# 2. Load Wi-Fi Atheros MADWiFi modules (non-fatal)
 MODULES_DIR=/pfrm2.0/lib/modules/dot11
 if [ -d "$MODULES_DIR" ]; then
     for mod in kdot11 wlan wlan_scan_ap ath_hal ath_dfs ath_rate_sample; do
@@ -400,18 +404,25 @@ if [ -d "$MODULES_DIR" ]; then
     done
 fi
 
-# Apply persisted atomic config.json in < 1s (zero SQLite rebuild). Never brick on failure.
-if ! /pfrm2.0/bin/rv180wd --boot >>/tmp/rv180wd-boot.log 2>&1; then
-    echo "[rv180w-next] rv180wd --boot failed! Reverting to platformInit.legacy" >>/tmp/rv180wd-boot.log
+# 3. Apply persisted atomic config.json (sets bdg1=192.168.1.1 over eth0.1 VLAN 1, dnsmasq, firewall)
+# Failsafe 3: if rv180wd crashes/fails hard, automatically revert to stock platformInit.legacy
+if ! /pfrm2.0/bin/rv180wd --boot >/dev/console 2>&1; then
+    echo "[rv180w-next] rv180wd --boot failed! Reverting to platformInit.legacy" >/dev/console
     exec /bin/sh /pfrm2.0/etc/platformInit.legacy
 fi
 
-# Launch single ultra-light control plane daemon (HTTP :80 + HTTPS TLS 1.2/1.3 :443)
+# 4. Launch single ultra-light control plane daemon (HTTP :80 + HTTPS TLS 1.2/1.3 :443)
 if [ -x /pfrm2.0/bin/rv180wd ]; then
     /pfrm2.0/bin/rv180wd --serve >/tmp/rv180wd.log 2>&1 &
+    sleep 2
 fi
 
-echo "[rv180w-next] Ready." >>/tmp/rv180wd-boot.log
+# 5. Print concise live diagnostics directly to UART console
+echo "[rv180w-next] LAN interface (bdg1):" >/dev/console
+/bin/busybox ifconfig bdg1 >/dev/console 2>&1
+echo "[rv180w-next] rv180wd startup log:" >/dev/console
+cat /tmp/rv180wd.log >/dev/console 2>&1
+echo "[rv180w-next] Ready -> http://192.168.1.1 & https://192.168.1.1" >/dev/console
 "#;
 
 /// Patch rootfs for `rv180w-next` v3.0: injects static ARMv6 `rv180wd` and Fast-Boot Init
@@ -473,7 +484,15 @@ pub fn patch_rootfs_next(work_dir: &Path, rv180wd_bin_path: &Path) -> Result<Pat
     fs::set_permissions(&plat_init, fs::Permissions::from_mode(0o755))?;
     patched.push("/pfrm2.0/etc/platformInit -> fastBootInit".to_string());
 
-    // 3. Write v3.0 release marker
+    // 3. Replace hardwareNat.lua (invoked by rcS after platformInit) so it doesn't query missing SQLite DB
+    let hw_nat = root.join("bin/hardwareNat.lua");
+    if hw_nat.exists() {
+        fs::write(&hw_nat, "-- Managed by rv180wd (no SQLite dependency)\n")?;
+        fs::set_permissions(&hw_nat, fs::Permissions::from_mode(0o755))?;
+        patched.push("/pfrm2.0/bin/hardwareNat.lua (clean no-SQLite stub)".to_string());
+    }
+
+    // 4. Write v3.0 release marker
     let mod_rel = root.join("etc/mod_release");
     fs::write(
         &mod_rel,

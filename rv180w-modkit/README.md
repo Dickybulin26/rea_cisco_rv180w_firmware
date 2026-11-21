@@ -43,7 +43,7 @@ chmod +x scripts/test_qemu.sh
 
 ## Prosedur Pemulihan Hardware (Wajib Sebelum Flash Fisik)
 
-1. Hubungkan adaptor **USB-to-TTL UART 3.3V** (`115200 8N1`, TX/RX/GND — **jangan hubungkan VCC!**) ke header serial PCB Cisco RV180W.
+1. Hubungkan adaptor **USB-to-TTL UART 3.3V** (`38400 8N1`, TX/RX/GND — **jangan hubungkan VCC!**) ke header serial PCB Cisco RV180W (`sudo picocom -b 38400 /dev/ttyUSB0`).
 2. Siapkan server **TFTP** lokal di PC (IP `192.168.1.2/24`) yang menyajikan salinan `RV180W-Firmware-1.0.5.4.img` asli agar dapat memulihkan melalui konsol **U-Boot** jika diperlukan.
 3. Unggah `dist/RV180W-Firmware-1.0.5.4-MOD.img` lewat *Administration -> Firmware Upgrade* sambil memantau konsol serial UART.
 4. Setelah reboot, akses `https://192.168.1.1` (dashboard utama) atau `https://192.168.1.1/modStatus.htm` (diagnostik baru). Sertifikat ECDSA P-256 otomatis tersimpan permanen di `/data/certs/modern_https.{crt,key}` (partisi JFFS2 `/dev/mtdblock3`).

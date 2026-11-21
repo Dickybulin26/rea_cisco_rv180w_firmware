@@ -705,20 +705,39 @@ pub fn run(opts: ServerOptions) -> Result<(), String> {
     let limiter = WorkerLimiter::new(opts.max_workers);
     spawn_safe_rollback_watcher(Arc::clone(&state));
 
-    // Start HTTPS (TLS 1.2 & TLS 1.3) listener if configured
-    if let Some(ref https_addr) = opts.https_addr {
-        let tls_cfg = load_or_create_tls_config(&opts.data_dir, &opts.san_ip)
-            .map_err(|e| format!("failed to init TLS 1.2/1.3 config: {e}"))?;
-        let https_listener = TcpListener::bind(https_addr)
-            .map_err(|e| format!("failed to bind HTTPS {https_addr}: {e}"))?;
-        eprintln!(
-            "[rv180wd] HTTPS (TLS 1.2/1.3) listening on https://{https_addr} (max_workers={})",
-            opts.max_workers
-        );
+    // Bind HTTP FIRST so http://192.168.1.1 is guaranteed reachable immediately even if TLS cert gen takes a moment
+    let http_listener = TcpListener::bind(&opts.http_addr)
+        .map_err(|e| format!("failed to bind HTTP {}: {e}", opts.http_addr))?;
+    eprintln!(
+        "[rv180wd] HTTP listening on http://{} (max_workers={})",
+        opts.http_addr, opts.max_workers
+    );
 
+    // Start HTTPS (TLS 1.2 & TLS 1.3) listener in background thread; never kill HTTP if TLS init fails
+    if let Some(https_addr) = opts.https_addr.clone() {
+        let data_dir = opts.data_dir.clone();
+        let san_ip = opts.san_ip.clone();
         let st = Arc::clone(&state);
         let lim = Arc::clone(&limiter);
+        let max_workers = opts.max_workers;
         thread::spawn(move || {
+            let tls_cfg = match load_or_create_tls_config(&data_dir, &san_ip) {
+                Ok(c) => c,
+                Err(e) => {
+                    eprintln!("[rv180wd] WARN: failed to init TLS 1.2/1.3 config (HTTP stays up): {e}");
+                    return;
+                }
+            };
+            let https_listener = match TcpListener::bind(&https_addr) {
+                Ok(l) => l,
+                Err(e) => {
+                    eprintln!("[rv180wd] WARN: failed to bind HTTPS {https_addr} (HTTP stays up): {e}");
+                    return;
+                }
+            };
+            eprintln!(
+                "[rv180wd] HTTPS (TLS 1.2/1.3) listening on https://{https_addr} (max_workers={max_workers})"
+            );
             for incoming in https_listener.incoming() {
                 match incoming {
                     Ok(stream) => {
@@ -741,13 +760,6 @@ pub fn run(opts: ServerOptions) -> Result<(), String> {
             }
         });
     }
-
-    let http_listener = TcpListener::bind(&opts.http_addr)
-        .map_err(|e| format!("failed to bind HTTP {}: {e}", opts.http_addr))?;
-    eprintln!(
-        "[rv180wd] HTTP listening on http://{} (max_workers={})",
-        opts.http_addr, opts.max_workers
-    );
 
     for incoming in http_listener.incoming() {
         match incoming {

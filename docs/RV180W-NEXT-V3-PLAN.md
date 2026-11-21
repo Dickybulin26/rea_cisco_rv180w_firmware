@@ -42,7 +42,7 @@ Berdasarkan bedah forensik terhadap firmware resmi **Cisco RV180W v1.0.5.4** (`L
 
 ## 3. Roadmap 6 Fase
 
-- [x] **Fase 1 — Audit HAL Hardware via REA (`hal/mod.rs`):** Pemetaan `cns3xxx.ko`, `bcm5398.ko`, `sppe_ioctl`, `vlan_table_func`, `set_wan_port_func`, MADWiFi Atheros (`ath_*`/`wlan_*`), `/proc/led`, `/proc/push_button`, `/proc/macAddress`, dan partisi MTD (`/dev/mtd1`/`mtd2`/`mtd3`).
+- [x] **Fase 1 — Audit HAL Hardware via REA (`hal/mod.rs`):** Pemetaan `cns3xxx.ko`, `bcm5398.ko` (`bcmswitch="bcm5395"`, `/dev/bcm53980`), `sppe_ioctl sppe <enable|disable>`, `vlan_table_func` (`eth0.1` VLAN 1 → bridge `bdg1`), `set_wan_port_func`, MADWiFi Atheros (`ath_*`/`wlan_*`), `/proc/led`, `/proc/push_button`, `/proc/macAddress`, dan partisi MTD riil 32 MB flash (`mtd0` UBoot 512 KB, `mtd1` Kernel 6 MiB `0x080000–0x680000`, `mtd2` Rootfs 23 MiB `0x680000–0x1D80000`, `mtd3` Config JFFS2 1 MiB `0x1D80000–0x1E80000`, RAM 128 MB, CPU 600 MHz).
 - [x] **Fase 2 — Atomic Config Store & Auth Aman (`config/` & `auth/`):** `config.json` atomic + `.bak` rollback atomik + diff engine 7 subsistem; `auth.json` (`0600`) PBKDF2-HMAC-SHA256 (tuned 25k iterasi untuk ARMv6), sliding session 256-bit, CSRF constant-time, rate-limiter terbatas.
 - [x] **Fase 3 — Zero-Reboot Hot-Reload Reconcilers (`reconciler/` & `upgrade/`):** Reconciler subsistem (`system`, `network`, `dhcp_dns`, `firewall` atomic `iptables-restore`, `wifi`, `qos`, `vpn`) + verifikasi exact `firmImageVerify` untuk safe upgrade.
 - [x] **Fase 4 — Native Rust HTTP + TLS 1.2/1.3 Server & Modern SPA (`server/` & `web-ui/`):** `rustls` TLS 1.2/1.3 ECDSA P-256 SAN `192.168.1.1`, REST API `/api/v1/*`, First-Boot Wizard, Safe-Rollback 60s, dan Modern Responsive SPA Dashboard.

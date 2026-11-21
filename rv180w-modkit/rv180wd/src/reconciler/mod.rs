@@ -70,12 +70,12 @@ pub mod system {
 
     pub fn reconcile(cfg: &Config) -> Result<(), String> {
         if !cfg.system.hostname.is_empty() {
-            let _ = hal::exec_cmd("/bin/hostname", &[&cfg.system.hostname]);
+            let _ = hal::exec_cmd("/bin/busybox", &["hostname", &cfg.system.hostname]);
         }
         if !hal::is_dry_run() {
             let _ = fs::write("/tmp/TZ", format!("{}\n", cfg.system.timezone));
         }
-        let _ = hal::exec_cmd("/usr/bin/killall", &["-q", "ntpd"]);
+        let _ = hal::exec_cmd("/bin/busybox", &["killall", "ntpd"]);
         if cfg.system.ntp_enabled {
             if let Some(server) = cfg.system.ntp_servers.first() {
                 let _ = hal::exec_cmd("/pfrm2.0/bin/ntpd", &["-p", server]);
@@ -94,29 +94,47 @@ pub mod network {
         let mut warnings: Vec<String> = Vec::new();
 
         let _ = hal::switch::configure_wan_port();
+        hal::switch::enable_lan_switch_ports();
 
-        // --- Critical: LAN interface (eth0) must be configured for management access ---
+        // --- Critical: LAN interface (eth0.1 VLAN 1 -> bdg1 bridge) for management access ---
+        // RV180W Cavium CNS3xxx PSE (`rcS`: vlan_table_func edit 1 0 4 5 1 ...) tags LAN frames
+        // to/from CPU on eth0 with 802.1Q VID=1 -> eth0.1, bridged into `bdg1` (exact stock layout).
+        let _ = hal::exec_cmd("/bin/busybox", &["ifconfig", "eth0", "0.0.0.0", "up"]);
+        let _ = hal::exec_cmd("/bin/busybox", &["vconfig", "add", "eth0", "1"]);
+        let _ = hal::exec_cmd("/bin/busybox", &["ifconfig", "eth0.1", "0.0.0.0", "up"]);
+        let _ = hal::exec_cmd("/pfrm2.0/bin/brctl", &["addbr", "bdg1"]);
+        let _ = hal::exec_cmd("/pfrm2.0/bin/brctl", &["setfd", "bdg1", "0"]);
+        let _ = hal::exec_cmd("/pfrm2.0/bin/brctl", &["addif", "bdg1", "eth0.1"]);
+
         let prefix = netmask_to_prefix(&cfg.network.lan.netmask);
         let lan_cidr = format!("{}/{}", cfg.network.lan.ip, prefix);
-        let _ = hal::exec_cmd("/sbin/ifconfig", &["eth0", "up"]);
-        let _ = hal::exec_cmd("/pfrm2.0/bin/ip", &["link", "set", "eth0", "up"]);
-        let _ = hal::exec_cmd("/pfrm2.0/bin/ip", &["addr", "flush", "dev", "eth0"]);
         let mut lan_ok = false;
-        // Try iproute2 first, fall back to ifconfig
-        if hal::exec_cmd("/pfrm2.0/bin/ip", &["addr", "add", &lan_cidr, "dev", "eth0"]).is_ok() {
+        if hal::exec_cmd(
+            "/bin/busybox",
+            &[
+                "ifconfig",
+                "bdg1",
+                &cfg.network.lan.ip,
+                "netmask",
+                &cfg.network.lan.netmask,
+                "up",
+            ],
+        )
+        .is_ok()
+        {
             lan_ok = true;
-        } else if hal::exec_cmd("/sbin/ifconfig", &["eth0", &cfg.network.lan.ip, "netmask", &cfg.network.lan.netmask]).is_ok() {
+        } else if hal::exec_cmd("/pfrm2.0/bin/ip", &["addr", "add", &lan_cidr, "dev", "bdg1"]).is_ok() {
+            let _ = hal::exec_cmd("/pfrm2.0/bin/ip", &["link", "set", "bdg1", "up"]);
             lan_ok = true;
         }
         if !lan_ok && !hal::is_dry_run() {
-            return Err("failed to configure LAN IP on eth0".to_string());
+            return Err("failed to configure LAN IP on bdg1".to_string());
         }
 
-        // --- Best-effort: WAN interface (eth1) ---
-        let _ = hal::exec_cmd("/usr/bin/killall", &["-q", "dhclient"]);
-        let _ = hal::exec_cmd("/usr/bin/killall", &["-q", "pppd"]);
-        let _ = hal::exec_cmd("/pfrm2.0/bin/ip", &["link", "set", "eth1", "up"]);
-        let _ = hal::exec_cmd("/sbin/ifconfig", &["eth1", "up"]);
+        // --- Best-effort: WAN interface (eth1) without reboot ---
+        let _ = hal::exec_cmd("/bin/busybox", &["killall", "dhclient"]);
+        let _ = hal::exec_cmd("/bin/busybox", &["killall", "pppd"]);
+        let _ = hal::exec_cmd("/bin/busybox", &["ifconfig", "eth1", "up"]);
 
         match cfg.network.wan.mode {
             WanMode::Dhcp => {
@@ -128,9 +146,10 @@ pub mod network {
                 if let (Some(ip), Some(mask)) =
                     (&cfg.network.wan.static_ip, &cfg.network.wan.static_netmask)
                 {
-                    let wan_cidr = format!("{}/{}", ip, netmask_to_prefix(mask));
-                    let _ = hal::exec_cmd("/pfrm2.0/bin/ip", &["addr", "flush", "dev", "eth1"]);
-                    if let Err(e) = hal::exec_cmd("/pfrm2.0/bin/ip", &["addr", "add", &wan_cidr, "dev", "eth1"]) {
+                    if let Err(e) = hal::exec_cmd(
+                        "/bin/busybox",
+                        &["ifconfig", "eth1", ip, "netmask", mask, "up"],
+                    ) {
                         warnings.push(format!("wan static addr: {e}"));
                     }
                     if let Some(gw) = &cfg.network.wan.static_gateway {
@@ -180,8 +199,10 @@ pub mod dhcp_dns {
     pub fn render_dnsmasq_conf(cfg: &Config) -> String {
         let mut s = String::from(
             "# Auto-generated by rv180wd (stored in tmpfs to avoid flash wear)\n\
-             interface=eth0\n\
+             user=root\n\
+             interface=bdg1\n\
              bind-interfaces\n\
+             pid-file=/var/run/dnsmasq.pid\n\
              dhcp-leasefile=/tmp/dnsmasq.leases\n\
              no-poll\n",
         );
@@ -214,7 +235,7 @@ pub mod dhcp_dns {
             fs::write("/tmp/dnsmasq.conf", conf)
                 .map_err(|e| format!("failed to write /tmp/dnsmasq.conf: {e}"))?;
         }
-        let _ = hal::exec_cmd("/usr/bin/killall", &["-q", "dnsmasq"]);
+        let _ = hal::exec_cmd("/bin/busybox", &["killall", "dnsmasq"]);
         if cfg.dhcp_dns.dhcp_enabled || !cfg.dhcp_dns.dns_servers.is_empty() {
             let _ = hal::exec_cmd("/pfrm2.0/bin/dnsmasq", &["-C", "/tmp/dnsmasq.conf"]);
         }
@@ -245,7 +266,7 @@ pub mod firewall {
         }
         out.push_str("-A POSTROUTING -o eth1 -j MASQUERADE\nCOMMIT\n");
 
-        // Filter table (default-deny WAN ingress)
+        // Filter table (default-deny WAN ingress, full LAN access on bdg1/eth0/ath0)
         let input_policy = if cfg.firewall.default_wan_ingress_deny {
             "DROP"
         } else {
@@ -255,6 +276,8 @@ pub mod firewall {
             "*filter\n:INPUT {input_policy} [0:0]\n:FORWARD DROP [0:0]\n:OUTPUT ACCEPT [0:0]\n\
              -A INPUT -i lo -j ACCEPT\n\
              -A INPUT -m state --state ESTABLISHED,RELATED -j ACCEPT\n\
+             -A INPUT -i bdg1 -j ACCEPT\n\
+             -A INPUT -i eth0.1 -j ACCEPT\n\
              -A INPUT -i eth0 -j ACCEPT\n\
              -A INPUT -i ath0 -j ACCEPT\n"
         ));
@@ -263,6 +286,7 @@ pub mod firewall {
         }
         out.push_str(
             "-A FORWARD -m state --state ESTABLISHED,RELATED -j ACCEPT\n\
+             -A FORWARD -i bdg1 -o eth1 -j ACCEPT\n\
              -A FORWARD -i eth0 -o eth1 -j ACCEPT\n\
              -A FORWARD -i ath0 -o eth1 -j ACCEPT\n",
         );
@@ -360,9 +384,9 @@ pub mod vpn {
 
     /// Strictly on-demand VPN services: 0 processes & 0 RAM when disabled.
     pub fn reconcile(cfg: &Config) -> Result<(), String> {
-        let _ = hal::exec_cmd("/usr/bin/killall", &["-q", "racoon"]);
-        let _ = hal::exec_cmd("/usr/bin/killall", &["-q", "pptpd"]);
-        let _ = hal::exec_cmd("/usr/bin/killall", &["-q", "l2tp"]);
+        let _ = hal::exec_cmd("/bin/busybox", &["killall", "racoon"]);
+        let _ = hal::exec_cmd("/bin/busybox", &["killall", "pptpd"]);
+        let _ = hal::exec_cmd("/bin/busybox", &["killall", "l2tp"]);
 
         if cfg.vpn.ipsec_enabled {
             let _ = hal::exec_cmd("/pfrm2.0/bin/racoon", &["-f", "/tmp/racoon.conf"]);
